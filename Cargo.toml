@@ -1,0 +1,28 @@
+[package]
+name = "mmux"
+version = "0.1.0"
+edition = "2021"
+description = "Muaz Multiplexer — a blazingly fast terminal multiplexer for Arch Linux / Hyprland"
+
+[[bin]]
+name = "mmux"
+path = "src/main.rs"
+
+[dependencies]
+# Only the tokio pieces mmux actually uses (avoids pulling all of "full").
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "io-util", "time"] }
+portable-pty = "0.8"
+vte = "0.13"
+ratatui = "0.29"
+crossterm = "0.28"
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+postcard = { version = "1", features = ["use-std"] }
+libc = "0.2"
+
+[profile.release]
+opt-level = "z"     # optimise for size
+lto = true          # full cross-crate inlining + dead-code stripping
+codegen-units = 1   # better optimisation at the cost of compile time
+panic = "abort"     # smaller binary; the panic hook still restores the terminal
+strip = true        # drop debug symbols

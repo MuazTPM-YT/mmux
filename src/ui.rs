@@ -67,20 +67,16 @@ fn draw_panes(f: &mut Frame, mgr: &mut Manager, area: Rect) {
             continue;
         };
 
-        let title = pane
-            .screen
-            .title
-            .clone()
-            .unwrap_or_else(|| format!("pane {}", pane.id));
         let border_style = if is_focused {
             Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
         } else {
             Style::default().fg(Color::DarkGray)
         };
+        // No title on the border — a bare, sleek frame whose only job is to show
+        // which pane is focused (cyan) and separate splits.
         let block = Block::default()
             .borders(Borders::ALL)
-            .border_style(border_style)
-            .title(Span::styled(format!(" {title} "), border_style));
+            .border_style(border_style);
         let inner = block.inner(outer);
         f.render_widget(block, outer);
 

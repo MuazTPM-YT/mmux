@@ -83,9 +83,23 @@ fn shifted_digit(c: char) -> Option<usize> {
 
 /// Encode an ordinary keystroke as the bytes a terminal application expects.
 /// Returns `None` for keys with no sensible byte representation.
-pub fn encode_key(key: KeyEvent) -> Option<Vec<u8>> {
+///
+/// `kitty` is true when the focused pane's app enabled the Kitty keyboard
+/// protocol. That lets us express keys with no legacy byte form — above all
+/// **Shift+Enter**, which is otherwise indistinguishable from a bare Enter and
+/// so just submits instead of inserting a newline (e.g. in Claude Code).
+pub fn encode_key(key: KeyEvent, kitty: bool) -> Option<Vec<u8>> {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     let alt = key.modifiers.contains(KeyModifiers::ALT);
+    let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+
+    // In Kitty mode, encode a *modified* Enter as a CSI-u sequence (`CSI 13 ; m u`).
+    // Unmodified Enter keeps its legacy `\r` so plain submits are unaffected.
+    if kitty && key.code == KeyCode::Enter && (ctrl || alt || shift) {
+        // Kitty modifier field = 1 + bitmask (Shift=1, Alt=2, Ctrl=4).
+        let m = 1 + (shift as u8) + 2 * (alt as u8) + 4 * (ctrl as u8);
+        return Some(format!("\x1b[13;{m}u").into_bytes());
+    }
 
     let bytes: Vec<u8> = match key.code {
         KeyCode::Char(c) => {
@@ -195,15 +209,47 @@ mod tests {
 
     #[test]
     fn encodes_control_and_arrows() {
-        let ctrl_c = encode_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
+        let ctrl_c = encode_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL), false);
         assert_eq!(ctrl_c, Some(vec![0x03]));
         assert_eq!(
-            encode_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE)),
+            encode_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE), false),
             Some(b"\x1b[A".to_vec())
         );
         assert_eq!(
-            encode_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            encode_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), false),
             Some(vec![b'\r'])
+        );
+    }
+
+    #[test]
+    fn shift_enter_needs_kitty_mode() {
+        let shift_enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT);
+        // Without the Kitty protocol there is no way to express it — falls back
+        // to a bare Enter (the pre-existing, unavoidable behaviour).
+        assert_eq!(encode_key(shift_enter, false), Some(vec![b'\r']));
+        // With it, Shift+Enter becomes the CSI-u form apps read as a newline.
+        assert_eq!(encode_key(shift_enter, true), Some(b"\x1b[13;2u".to_vec()));
+    }
+
+    #[test]
+    fn kitty_mode_leaves_plain_enter_alone() {
+        // A bare Enter must still submit even in Kitty mode.
+        assert_eq!(
+            encode_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), true),
+            Some(vec![b'\r'])
+        );
+    }
+
+    #[test]
+    fn kitty_mode_encodes_modifier_combos() {
+        // Ctrl+Enter = 1+4 = 5; Alt+Enter = 1+2 = 3.
+        assert_eq!(
+            encode_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL), true),
+            Some(b"\x1b[13;5u".to_vec())
+        );
+        assert_eq!(
+            encode_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT), true),
+            Some(b"\x1b[13;3u".to_vec())
         );
     }
 }

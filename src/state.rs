@@ -149,7 +149,6 @@ pub fn split_rect(area: Rect, dir: SplitDir, ratio: u16) -> (Rect, Rect) {
 
 /// One terminal: a VTE parser feeding a [`Screen`], backed by a [`PtyProcess`].
 pub struct Pane {
-    pub id: u64,
     pub screen: Screen,
     parser: Parser,
     pub process: PtyProcess,
@@ -168,6 +167,19 @@ impl Pane {
         if !self.screen.responses.is_empty() {
             let reply = std::mem::take(&mut self.screen.responses);
             self.process.write(&reply);
+        }
+    }
+
+    /// Forward pasted text to the shell. If the app enabled bracketed-paste mode
+    /// (DECSET 2004) the text is wrapped in `ESC[200~`/`ESC[201~` so the shell
+    /// treats it as literal data; otherwise the raw bytes are written.
+    pub fn paste(&mut self, text: &str) {
+        if self.screen.bracketed_paste {
+            self.process.write(b"\x1b[200~");
+            self.process.write(text.as_bytes());
+            self.process.write(b"\x1b[201~");
+        } else {
+            self.process.write(text.as_bytes());
         }
     }
 }
@@ -238,7 +250,6 @@ impl Manager {
         self.panes.insert(
             id,
             Pane {
-                id,
                 screen: Screen::new(DEFAULT_COLS, DEFAULT_ROWS),
                 parser: Parser::new(),
                 process,

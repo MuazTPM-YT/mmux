@@ -13,7 +13,11 @@ use std::process::{Command, Stdio};
 use std::time::Duration;
 
 use anyhow::{anyhow, Result};
-use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::event::{
+    DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyEventKind,
+    KeyModifiers, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
+    PushKeyboardEnhancementFlags,
+};
 use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
@@ -168,6 +172,13 @@ async fn drive(mut session: String) -> Result<()> {
                             term.draw(|f| overlay::render(f, ov, &session))?;
                         }
                     }
+                    Some(Event::Paste(text)) => {
+                        // Ignore pastes while an overlay owns the screen; otherwise
+                        // forward to the session, which routes it to the focused pane.
+                        if overlay.is_none() {
+                            write_msg(&mut conn.writer, &ClientMsg::Paste(text)).await?;
+                        }
+                    }
                     Some(_) => {}
                     None => break,
                 }
@@ -202,7 +213,19 @@ fn is_chord(key: &KeyEvent, c: char) -> bool {
 fn setup_terminal() -> Result<()> {
     enable_raw_mode()?;
     let mut stdout: Stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
+    // EnableBracketedPaste (DECSET 2004) tells the outer terminal that mmux
+    // handles pastes safely — without it, terminals like Ghostty warn on every
+    // paste containing control codes, because unbracketed pastes are injected as
+    // raw keystrokes. It also makes crossterm coalesce pastes into `Event::Paste`.
+    execute!(stdout, EnterAlternateScreen, EnableBracketedPaste)?;
+    // Ask the outer terminal to disambiguate escape codes (Kitty keyboard
+    // protocol). Without this, terminals fold Shift+Enter into a bare `\r`, so
+    // the modifier never reaches mmux and apps like Claude Code can't tell the
+    // two apart. Harmless on terminals that don't support it — they ignore it.
+    let _ = execute!(
+        stdout,
+        PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+    );
     write!(stdout, "\x1b[?25l")?; // hide cursor
     stdout.flush()?;
     Ok(())
@@ -211,6 +234,8 @@ fn setup_terminal() -> Result<()> {
 fn restore_terminal() -> Result<()> {
     let mut stdout = io::stdout();
     let _ = write!(stdout, "\x1b[?25h");
+    let _ = execute!(stdout, PopKeyboardEnhancementFlags);
+    let _ = execute!(stdout, DisableBracketedPaste);
     execute!(stdout, LeaveAlternateScreen)?;
     disable_raw_mode()?;
     let _ = stdout.flush();

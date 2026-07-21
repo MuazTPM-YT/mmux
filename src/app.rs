@@ -90,12 +90,24 @@ impl App {
             self.apply_action(action);
             true
         } else {
-            if let Some(bytes) = keys::encode_key(key) {
-                if let Some(pane) = self.mgr.focused_pane_mut() {
+            if let Some(pane) = self.mgr.focused_pane_mut() {
+                let kitty = pane.screen.kitty_keyboard != 0;
+                if let Some(bytes) = keys::encode_key(key, kitty) {
                     pane.process.write(&bytes);
                 }
             }
             false
+        }
+    }
+
+    /// Forward pasted text to the focused pane's shell. Like a forwarded
+    /// keystroke this never changes mmux state, so it needs no redraw — the
+    /// shell's echo triggers one.
+    pub(crate) fn paste(&mut self, text: &str) {
+        if let Mode::Normal = self.mode {
+            if let Some(pane) = self.mgr.focused_pane_mut() {
+                pane.paste(text);
+            }
         }
     }
 

@@ -52,6 +52,17 @@ pub struct Screen {
     /// The owning `Pane` drains this after each parse and writes it to the PTY;
     /// leaving these unanswered makes shells like fish stall for ~10s on startup.
     pub responses: Vec<u8>,
+    /// Whether the pane's app enabled bracketed-paste mode (DECSET 2004). When
+    /// set, pasted text forwarded to this pane is wrapped in `ESC[200~`/`ESC[201~`
+    /// so the shell treats it as literal data instead of executable keystrokes.
+    pub bracketed_paste: bool,
+    /// Current Kitty keyboard-protocol flags for this pane (0 = disabled). Apps
+    /// like Claude Code enable it (`CSI > flags u`) to receive keys that legacy
+    /// encodings can't express — notably Shift+Enter. When non-zero, the server
+    /// encodes modified keys for this pane in Kitty CSU form (see `keys::encode_key`).
+    pub kitty_keyboard: u8,
+    /// Saved-flag stack backing the protocol's push (`>`) / pop (`<`) operations.
+    kitty_stack: Vec<u8>,
 
     // Pending pen attributes applied to newly printed cells.
     pen: Cell,
@@ -77,6 +88,9 @@ impl Screen {
             cy: 0,
             title: None,
             responses: Vec::new(),
+            bracketed_paste: false,
+            kitty_keyboard: 0,
+            kitty_stack: Vec::new(),
             pen: Cell::default(),
             wrap_pending: false,
             saved: (0, 0),
@@ -384,7 +398,54 @@ impl Perform for Screen {
                 }
                 return;
             }
+            // Kitty keyboard protocol management. These all carry a private
+            // marker, so a *bare* `CSI u` (DECRC) still falls through to the
+            // cursor-restore arm below — keep that distinction intact.
+            'u' if !intermediates.is_empty() => {
+                match intermediates.first() {
+                    // Query: report the current flags so the app knows we speak
+                    // the protocol and enables it.
+                    Some(&b'?') => {
+                        self.responses.extend_from_slice(b"\x1b[?");
+                        self.responses
+                            .extend_from_slice(self.kitty_keyboard.to_string().as_bytes());
+                        self.responses.push(b'u');
+                    }
+                    // Push: save current, adopt the new flags.
+                    Some(&b'>') => {
+                        self.kitty_stack.push(self.kitty_keyboard);
+                        self.kitty_keyboard = arg(params, 0, 0) as u8;
+                    }
+                    // Pop N levels (default 1).
+                    Some(&b'<') => {
+                        for _ in 0..arg(params, 0, 1) {
+                            self.kitty_keyboard = self.kitty_stack.pop().unwrap_or(0);
+                        }
+                    }
+                    // Set with mode: 1=replace (default), 2=or, 3=and-not.
+                    Some(&b'=') => {
+                        let flags = arg(params, 0, 0) as u8;
+                        match arg(params, 1, 1) {
+                            2 => self.kitty_keyboard |= flags,
+                            3 => self.kitty_keyboard &= !flags,
+                            _ => self.kitty_keyboard = flags,
+                        }
+                    }
+                    _ => {}
+                }
+                return;
+            }
             _ => {}
+        }
+
+        // DEC private mode set/reset `ESC[?<n>h` / `ESC[?<n>l`. We don't emulate
+        // most modes, but we must *track* bracketed paste (2004) so forwarded
+        // pastes can be wrapped correctly — see `Pane::paste`.
+        if intermediates.first() == Some(&b'?') && (action == 'h' || action == 'l') {
+            if arg(params, 0, 0) == 2004 {
+                self.bracketed_paste = action == 'h';
+            }
+            return;
         }
 
         // Any other CSI carrying an intermediate / private marker — e.g.
@@ -597,6 +658,37 @@ mod tests {
         assert!(!cell.underline, "private CSI must not set underline");
         assert!(!cell.dim);
         assert!(!s.pen.underline);
+    }
+
+    #[test]
+    fn tracks_bracketed_paste_mode() {
+        // Off by default; DECSET 2004 enables, DECRST 2004 disables.
+        let s = render(20, 5, b"");
+        assert!(!s.bracketed_paste);
+        let s = render(20, 5, b"\x1b[?2004h");
+        assert!(s.bracketed_paste);
+        let s = render(20, 5, b"\x1b[?2004h\x1b[?2004l");
+        assert!(!s.bracketed_paste);
+    }
+
+    #[test]
+    fn tracks_kitty_keyboard_flags() {
+        // Push flags 1, then query: the reply reports the current flags.
+        let s = render(20, 5, b"\x1b[>1u\x1b[?u");
+        assert_eq!(s.kitty_keyboard, 1);
+        assert_eq!(s.responses, b"\x1b[?1u");
+        // Pop restores the previous (disabled) state.
+        let s = render(20, 5, b"\x1b[>1u\x1b[<u");
+        assert_eq!(s.kitty_keyboard, 0);
+    }
+
+    #[test]
+    fn bare_csi_u_is_still_cursor_restore_with_kitty_support() {
+        // Regression guard: DECRC (bare `ESC[u`, no marker) must keep restoring
+        // the cursor even though we now special-case marked `u` sequences.
+        let s = render(20, 5, b"\x1b[s\x1b[3;5H\x1b[u");
+        assert_eq!((s.cx, s.cy), (0, 0));
+        assert_eq!(s.kitty_keyboard, 0);
     }
 
     /// `ESC[>1u` is a Kitty-keyboard push, not DECRC (cursor restore).

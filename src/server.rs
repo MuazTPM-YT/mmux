@@ -136,6 +136,7 @@ pub async fn run(mut name: String) -> Result<()> {
                             }
                         }
                     }
+                    Ok(ClientMsg::Paste(text)) => app.paste(&text),
                     Ok(ClientMsg::Shutdown) => shutdown = true,
                     Ok(ClientMsg::Rename(new)) => rename_to = Some(new),
                     Ok(ClientMsg::Detach) | Err(_) => {

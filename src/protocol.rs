@@ -20,6 +20,8 @@ pub enum ClientMsg {
     Attach { cols: u16, rows: u16 },
     /// A keystroke to feed to the session.
     Key(WireKey),
+    /// A bracketed paste from the client's terminal, forwarded to the focused pane.
+    Paste(String),
     /// The client's terminal was resized.
     Resize { cols: u16, rows: u16 },
     /// Ask the server to emit a full frame (after the client painted an overlay).

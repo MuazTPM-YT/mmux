@@ -38,6 +38,12 @@ async fn main() -> Result<()> {
             println!("mmux {}", env!("CARGO_PKG_VERSION"));
             Ok(())
         }
+        // An unrecognised flag is a typo, not a session name — creating a
+        // session called "__foo" silently would be worse than saying so.
+        Some(flag) if flag.starts_with('-') => {
+            eprintln!("mmux: unknown option '{flag}' (try --help)");
+            std::process::exit(2);
+        }
         Some(name) => client::run(session::sanitize(name)).await,
         None => client::run("default".into()).await,
     }

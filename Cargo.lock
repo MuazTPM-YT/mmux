@@ -392,6 +392,7 @@ dependencies = [
  "ratatui",
  "serde",
  "tokio",
+ "unicode-width 0.2.0",
  "vte",
 ]
 
@@ -843,6 +844,7 @@ dependencies = [
  "libc",
  "mio",
  "pin-project-lite",
+ "signal-hook-registry",
  "socket2",
  "tokio-macros",
  "windows-sys 0.61.2",

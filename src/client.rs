@@ -121,26 +121,37 @@ async fn drive(mut session: String) -> Result<()> {
                     Some(Event::Key(key)) => {
                         if key.kind == KeyEventKind::Release { continue; }
                         if let Some(mut ov) = overlay.take() {
-                            let nav = overlay::handle_key(&mut ov, key, &session);
+                            // The switcher probes every session socket and can
+                            // block for up to a second waiting on a rename or
+                            // shutdown. `block_in_place` lets tokio move the rest
+                            // of the runtime off this worker instead of stalling
+                            // it, so frames keep draining while we wait.
+                            let nav = tokio::task::block_in_place(|| {
+                                overlay::handle_key(&mut ov, key, &session)
+                            });
                             match nav {
                                 overlay::Nav::Stay => overlay = Some(ov),
                                 overlay::Nav::Close => {
                                     // Repaint the underlying session.
-                                    write_msg(&mut conn.writer, &ClientMsg::Redraw).await?;
+                                    if write_msg(&mut conn.writer, &ClientMsg::Redraw).await.is_err() {
+                                        break;
+                                    }
                                 }
                                 overlay::Nav::Renamed(new) => {
                                     // Current session renamed; the live connection
                                     // is unaffected — just adopt the new name.
                                     session = new;
-                                    write_msg(&mut conn.writer, &ClientMsg::Redraw).await?;
+                                    if write_msg(&mut conn.writer, &ClientMsg::Redraw).await.is_err() {
+                                        break;
+                                    }
                                 }
                                 overlay::Nav::Switch(target) => {
                                     if target != session {
                                         let _ = write_msg(&mut conn.writer, &ClientMsg::Detach).await;
                                         conn = connect_session(&target, cols, rows).await?;
                                         session = target;
-                                    } else {
-                                        write_msg(&mut conn.writer, &ClientMsg::Redraw).await?;
+                                    } else if write_msg(&mut conn.writer, &ClientMsg::Redraw).await.is_err() {
+                                        break;
                                     }
                                 }
                             }
@@ -160,13 +171,18 @@ async fn drive(mut session: String) -> Result<()> {
                             term.clear()?;
                             term.draw(|f| overlay::render(f, &ov, &session))?;
                             overlay = Some(ov);
-                        } else {
-                            write_msg(&mut conn.writer, &ClientMsg::Key(WireKey::from_event(key))).await?;
+                        } else if write_msg(&mut conn.writer, &ClientMsg::Key(WireKey::from_event(key)))
+                            .await
+                            .is_err()
+                        {
+                            break; // server gone — leave cleanly, not with an error
                         }
                     }
                     Some(Event::Resize(c, r)) => {
                         cols = c; rows = r;
-                        write_msg(&mut conn.writer, &ClientMsg::Resize { cols, rows }).await?;
+                        if write_msg(&mut conn.writer, &ClientMsg::Resize { cols, rows }).await.is_err() {
+                            break;
+                        }
                         if let Some(ov) = &overlay {
                             term.clear()?;
                             term.draw(|f| overlay::render(f, ov, &session))?;
@@ -175,8 +191,10 @@ async fn drive(mut session: String) -> Result<()> {
                     Some(Event::Paste(text)) => {
                         // Ignore pastes while an overlay owns the screen; otherwise
                         // forward to the session, which routes it to the focused pane.
-                        if overlay.is_none() {
-                            write_msg(&mut conn.writer, &ClientMsg::Paste(text)).await?;
+                        if overlay.is_none()
+                            && write_msg(&mut conn.writer, &ClientMsg::Paste(text)).await.is_err()
+                        {
+                            break;
                         }
                     }
                     Some(_) => {}

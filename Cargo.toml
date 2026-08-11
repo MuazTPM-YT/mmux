@@ -10,9 +10,13 @@ path = "src/main.rs"
 
 [dependencies]
 # Only the tokio pieces mmux actually uses (avoids pulling all of "full").
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "io-util", "time"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "io-util", "time", "signal"] }
 portable-pty = "0.8"
 vte = "0.13"
+# Column widths for CJK / emoji. Already in the tree via ratatui; taking a
+# direct dependency is what lets `Screen` keep its grid aligned with what the
+# real terminal draws.
+unicode-width = "0.2"
 ratatui = "0.29"
 crossterm = "0.28"
 anyhow = "1"

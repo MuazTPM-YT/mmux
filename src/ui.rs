@@ -58,7 +58,10 @@ fn draw_tabs(f: &mut Frame, mgr: &Manager, session: &str, area: Rect) {
 fn draw_panes(f: &mut Frame, mgr: &mut Manager, area: Rect) {
     // Snapshot the leaf rects, then release the immutable borrow on `mgr`.
     let mut rects: Vec<(u64, Rect)> = Vec::new();
-    mgr.active_space().root.compute_rects(area, &mut rects);
+    let Some(space) = mgr.active_space() else {
+        return;
+    };
+    space.root.compute_rects(area, &mut rects);
     let focused = mgr.focused_id();
 
     for (id, outer) in rects {
@@ -88,43 +91,74 @@ fn draw_panes(f: &mut Frame, mgr: &mut Manager, area: Rect) {
 }
 
 /// Copy a screen's cell grid directly into the ratatui buffer.
+///
+/// Double-width glyphs need care in both directions: the continuation cell must
+/// be emitted as an empty symbol (ratatui's diff then skips the column the glyph
+/// already covers), and a glyph whose second half would land outside `inner` is
+/// replaced by a space so it cannot bleed over the pane border.
 fn blit_screen(f: &mut Frame, screen: &crate::screen::Screen, inner: Rect, focused: bool) {
+    // Park the cursor on the left half of a wide glyph, never on its
+    // continuation cell — otherwise the block lands on a column the terminal
+    // never draws separately.
+    let cursor = (focused && screen.cursor_visible).then(|| {
+        let cx = match screen.cell(screen.cx, screen.cy) {
+            Some(c) if c.width == 0 => screen.cx.saturating_sub(1),
+            _ => screen.cx,
+        };
+        (cx, screen.cy)
+    });
+
     let buf = f.buffer_mut();
     for y in 0..inner.height {
         for x in 0..inner.width {
             let Some(dst) = buf.cell_mut((inner.x + x, inner.y + y)) else {
                 continue;
             };
-            match screen.cell(x, y) {
-                Some(sc) => {
-                    // The terminal cursor is drawn as a solid block using a fixed
-                    // colour so it stays bright regardless of the cell beneath it
-                    // (e.g. it must not go grey over a dim autosuggestion).
-                    if focused && x == screen.cx && y == screen.cy {
-                        dst.set_char(sc.ch);
-                        dst.set_style(Style::default().fg(Color::Black).bg(Color::White));
-                        continue;
-                    }
-                    let mut style = Style::default().fg(sc.fg).bg(sc.bg);
-                    if sc.bold {
-                        style = style.add_modifier(Modifier::BOLD);
-                    }
-                    if sc.dim {
-                        style = style.add_modifier(Modifier::DIM);
-                    }
-                    if sc.underline {
-                        style = style.add_modifier(Modifier::UNDERLINED);
-                    }
-                    if sc.reverse {
-                        style = style.add_modifier(Modifier::REVERSED);
-                    }
-                    dst.set_char(sc.ch);
-                    dst.set_style(style);
+            let Some(sc) = screen.cell(x, y) else {
+                dst.set_char(' ');
+                dst.set_style(Style::default());
+                continue;
+            };
+
+            // The terminal cursor is drawn as a solid block using a fixed colour
+            // so it stays bright regardless of the cell beneath it (e.g. it must
+            // not go grey over a dim autosuggestion).
+            let style = if cursor == Some((x, y)) {
+                Style::default().fg(Color::Black).bg(Color::White)
+            } else {
+                let mut style = Style::default().fg(sc.fg).bg(sc.bg);
+                if sc.bold {
+                    style = style.add_modifier(Modifier::BOLD);
                 }
-                None => {
-                    dst.set_char(' ');
+                if sc.dim {
+                    style = style.add_modifier(Modifier::DIM);
                 }
-            }
+                if sc.italic {
+                    style = style.add_modifier(Modifier::ITALIC);
+                }
+                if sc.underline {
+                    style = style.add_modifier(Modifier::UNDERLINED);
+                }
+                if sc.blink {
+                    style = style.add_modifier(Modifier::SLOW_BLINK);
+                }
+                if sc.reverse {
+                    style = style.add_modifier(Modifier::REVERSED);
+                }
+                if sc.strike {
+                    style = style.add_modifier(Modifier::CROSSED_OUT);
+                }
+                style
+            };
+
+            match sc.width {
+                // Right half of a wide glyph: an empty symbol, which ratatui's
+                // diff skips because the lead cell already claimed this column.
+                0 => dst.set_symbol(""),
+                2 if x + 1 >= inner.width => dst.set_char(' '),
+                _ => dst.set_char(sc.ch),
+            };
+            dst.set_style(style);
         }
     }
 }
@@ -145,7 +179,7 @@ fn draw_status(f: &mut Frame, mgr: &Manager, mode: &Mode, area: Rect) {
             f.render_widget(Paragraph::new(line).style(bar), area);
         }
         Mode::Normal => {
-            let space = mgr.active_space().name.clone();
+            let space = mgr.active_space().map(|s| s.name.as_str()).unwrap_or("");
             let text = format!(
                 " [{space}]  Alt+wasd focus · Alt+WASD new pane · q close · t new · r rename · 1-9 space · ←/→ cycle "
             );

@@ -9,7 +9,7 @@ use std::collections::HashMap;
 
 use anyhow::Result;
 use ratatui::layout::Rect;
-use tokio::sync::mpsc::UnboundedSender;
+use tokio::sync::mpsc::Sender;
 use vte::Parser;
 
 use crate::pty::{PtyEvent, PtyProcess};
@@ -119,27 +119,38 @@ impl Node {
 }
 
 /// Divide `area` into two child rects according to `dir` and `ratio`.
+///
+/// Degenerate areas (fewer than two rows/columns to share, or none at all) are
+/// handled explicitly: the children stay inside `area` and never claim a row or
+/// column that isn't there. Getting this wrong produced rects that started past
+/// the end of the buffer.
 pub fn split_rect(area: Rect, dir: SplitDir, ratio: u16) -> (Rect, Rect) {
     let ratio = ratio.clamp(1, 99);
     match dir {
         SplitDir::Horizontal => {
+            if area.width < 2 {
+                return (area, Rect { x: area.x + area.width, width: 0, ..area });
+            }
             let wa = (area.width as u32 * ratio as u32 / 100) as u16;
-            let wa = wa.clamp(1, area.width.saturating_sub(1).max(1));
+            let wa = wa.clamp(1, area.width - 1);
             let a = Rect { width: wa, ..area };
             let b = Rect {
                 x: area.x + wa,
-                width: area.width.saturating_sub(wa),
+                width: area.width - wa,
                 ..area
             };
             (a, b)
         }
         SplitDir::Vertical => {
+            if area.height < 2 {
+                return (area, Rect { y: area.y + area.height, height: 0, ..area });
+            }
             let ha = (area.height as u32 * ratio as u32 / 100) as u16;
-            let ha = ha.clamp(1, area.height.saturating_sub(1).max(1));
+            let ha = ha.clamp(1, area.height - 1);
             let a = Rect { height: ha, ..area };
             let b = Rect {
                 y: area.y + ha,
-                height: area.height.saturating_sub(ha),
+                height: area.height - ha,
                 ..area
             };
             (a, b)
@@ -198,7 +209,7 @@ pub struct Manager {
     /// Bumped whenever the set of space *names* changes, so the server can skip
     /// re-persisting (and cloning every name) on the hot PTY-output path.
     spaces_gen: u64,
-    tx: UnboundedSender<PtyEvent>,
+    tx: Sender<PtyEvent>,
 }
 
 const DEFAULT_COLS: u16 = 80;
@@ -207,7 +218,7 @@ const DEFAULT_ROWS: u16 = 24;
 impl Manager {
     /// Build a manager whose spaces are named by `space_names` (each with a
     /// single fresh pane). An empty list yields one space called "main".
-    pub fn new(tx: UnboundedSender<PtyEvent>, space_names: &[String]) -> Result<Self> {
+    pub fn new(tx: Sender<PtyEvent>, space_names: &[String]) -> Result<Self> {
         let mut mgr = Manager {
             spaces: Vec::new(),
             active: 0,
@@ -259,14 +270,18 @@ impl Manager {
         Ok(id)
     }
 
-    pub fn active_space(&self) -> &Space {
-        let i = self.active.min(self.spaces.len().saturating_sub(1));
-        &self.spaces[i]
+    /// The focused Space, or `None` once every Space has been closed.
+    ///
+    /// This deliberately returns an `Option` rather than indexing: a panic in the
+    /// server aborts the daemon and takes every shell in the session with it, so
+    /// no render path may be able to panic on empty state.
+    pub fn active_space(&self) -> Option<&Space> {
+        self.spaces.get(self.active.min(self.spaces.len().saturating_sub(1)))
     }
 
-    fn active_space_mut(&mut self) -> &mut Space {
+    fn active_space_mut(&mut self) -> Option<&mut Space> {
         let i = self.active.min(self.spaces.len().saturating_sub(1));
-        &mut self.spaces[i]
+        self.spaces.get_mut(i)
     }
 
     pub fn focused_id(&self) -> Option<u64> {
@@ -287,8 +302,10 @@ impl Manager {
     /// move focus to the new pane. Left/Right split horizontally (side by side);
     /// Up/Down split vertically (stacked). The side determines child order.
     pub fn new_pane(&mut self, dir: Direction) -> Result<()> {
+        let Some(target) = self.active_space().map(|s| s.focused) else {
+            return Ok(());
+        };
         let new_id = self.spawn_pane()?;
-        let target = self.active_space().focused;
         let (split_dir, new_first) = match dir {
             Direction::Left => (SplitDir::Horizontal, true),
             Direction::Right => (SplitDir::Horizontal, false),
@@ -306,9 +323,10 @@ impl Manager {
             a: Box::new(a),
             b: Box::new(b),
         };
-        let space = self.active_space_mut();
-        space.root.replace_leaf(target, repl);
-        space.focused = new_id;
+        if let Some(space) = self.active_space_mut() {
+            space.root.replace_leaf(target, repl);
+            space.focused = new_id;
+        }
         Ok(())
     }
 
@@ -409,7 +427,10 @@ impl Manager {
         let (cx, cy) = center(cur);
 
         let mut ids = Vec::new();
-        self.active_space().root.leaves(&mut ids);
+        let Some(space) = self.active_space() else {
+            return;
+        };
+        space.root.leaves(&mut ids);
 
         let mut best: Option<(u64, i64)> = None;
         for id in ids {
@@ -441,7 +462,9 @@ impl Manager {
         }
 
         if let Some((id, _)) = best {
-            self.active_space_mut().focused = id;
+            if let Some(space) = self.active_space_mut() {
+                space.focused = id;
+            }
         }
     }
 }

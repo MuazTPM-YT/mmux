@@ -81,61 +81,146 @@ fn shifted_digit(c: char) -> Option<usize> {
     "!@#$%^&*(".chars().position(|s| s == c)
 }
 
+/// How the focused pane wants keys encoded, as reported by its own escape
+/// sequences. Both flags live on that pane's [`crate::screen::Screen`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct KeyMode {
+    /// The app enabled the Kitty keyboard protocol (`CSI > flags u`).
+    pub kitty: bool,
+    /// DECCKM (`CSI ? 1 h`) — cursor keys must be sent as SS3, not CSI.
+    pub app_cursor: bool,
+}
+
+/// xterm's modifier parameter: 1 + Shift(1) + Alt(2) + Ctrl(4).
+fn modifier_param(key: &KeyEvent) -> u8 {
+    let m = key.modifiers;
+    1 + m.contains(KeyModifiers::SHIFT) as u8
+        + 2 * m.contains(KeyModifiers::ALT) as u8
+        + 4 * m.contains(KeyModifiers::CONTROL) as u8
+}
+
 /// Encode an ordinary keystroke as the bytes a terminal application expects.
 /// Returns `None` for keys with no sensible byte representation.
 ///
-/// `kitty` is true when the focused pane's app enabled the Kitty keyboard
-/// protocol. That lets us express keys with no legacy byte form — above all
-/// **Shift+Enter**, which is otherwise indistinguishable from a bare Enter and
-/// so just submits instead of inserting a newline (e.g. in Claude Code).
-pub fn encode_key(key: KeyEvent, kitty: bool) -> Option<Vec<u8>> {
+/// Two details that legacy encodings get wrong and apps notice:
+///
+/// * **Modified cursor keys.** `Ctrl+Right` must be `CSI 1;5C`, not a bare
+///   `CSI C` — dropping the modifier is why word-wise motion did nothing.
+/// * **DECCKM.** While an app has application cursor-key mode on, arrows are
+///   `ESC O A` rather than `ESC [ A`; sending the wrong form makes some
+///   full-screen apps see garbage instead of a keypress.
+///
+/// `mode.kitty` additionally lets us express keys with no legacy byte form —
+/// above all **Shift+Enter**, which is otherwise indistinguishable from a bare
+/// Enter and so just submits instead of inserting a newline (e.g. in Claude Code).
+pub fn encode_key(key: KeyEvent, mode: KeyMode) -> Option<Vec<u8>> {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     let alt = key.modifiers.contains(KeyModifiers::ALT);
     let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+    let modified = ctrl || alt || shift;
+    let m = modifier_param(&key);
 
     // In Kitty mode, encode a *modified* Enter as a CSI-u sequence (`CSI 13 ; m u`).
     // Unmodified Enter keeps its legacy `\r` so plain submits are unaffected.
-    if kitty && key.code == KeyCode::Enter && (ctrl || alt || shift) {
-        // Kitty modifier field = 1 + bitmask (Shift=1, Alt=2, Ctrl=4).
-        let m = 1 + (shift as u8) + 2 * (alt as u8) + 4 * (ctrl as u8);
+    if mode.kitty && key.code == KeyCode::Enter && modified {
         return Some(format!("\x1b[13;{m}u").into_bytes());
     }
 
+    // Cursor / editing keys. `final_byte` keys use the `CSI 1 ; m X` form when
+    // modified and SS3 when the app asked for it; `~` keys use `CSI n ; m ~`.
+    let cursor_key = |last: u8| -> Vec<u8> {
+        if modified {
+            format!("\x1b[1;{m}{}", last as char).into_bytes()
+        } else if mode.app_cursor {
+            vec![0x1b, b'O', last]
+        } else {
+            vec![0x1b, b'[', last]
+        }
+    };
+    let tilde_key = |n: u8| -> Vec<u8> {
+        if modified {
+            format!("\x1b[{n};{m}~").into_bytes()
+        } else {
+            format!("\x1b[{n}~").into_bytes()
+        }
+    };
+
     let bytes: Vec<u8> = match key.code {
         KeyCode::Char(c) => {
+            let mut out = Vec::with_capacity(5);
+            if alt {
+                out.push(0x1b); // Meta -> ESC prefix
+            }
             if ctrl {
-                // Control codes: map to the C0 range (e.g. Ctrl-C -> 0x03).
-                let b = (c.to_ascii_uppercase() as u8) & 0x1f;
-                vec![b]
+                match ctrl_byte(c) {
+                    Some(b) => out.push(b),
+                    // Ctrl with a key that has no control code (e.g. Ctrl+é):
+                    // send the character itself rather than a truncated byte.
+                    None => {
+                        let mut buf = [0u8; 4];
+                        out.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
+                    }
+                }
             } else {
                 let mut buf = [0u8; 4];
-                let s = c.encode_utf8(&mut buf);
-                let mut out = Vec::new();
-                if alt {
-                    out.push(0x1b); // Meta -> ESC prefix
-                }
-                out.extend_from_slice(s.as_bytes());
-                out
+                out.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
             }
+            out
         }
         KeyCode::Enter => vec![b'\r'],
-        KeyCode::Backspace => vec![0x7f],
+        KeyCode::Backspace => {
+            if alt {
+                vec![0x1b, 0x7f]
+            } else {
+                vec![0x7f]
+            }
+        }
         KeyCode::Tab => vec![b'\t'],
         KeyCode::BackTab => b"\x1b[Z".to_vec(),
         KeyCode::Esc => vec![0x1b],
-        KeyCode::Up => b"\x1b[A".to_vec(),
-        KeyCode::Down => b"\x1b[B".to_vec(),
-        KeyCode::Right => b"\x1b[C".to_vec(),
-        KeyCode::Left => b"\x1b[D".to_vec(),
-        KeyCode::Home => b"\x1b[H".to_vec(),
-        KeyCode::End => b"\x1b[F".to_vec(),
-        KeyCode::PageUp => b"\x1b[5~".to_vec(),
-        KeyCode::PageDown => b"\x1b[6~".to_vec(),
-        KeyCode::Delete => b"\x1b[3~".to_vec(),
-        KeyCode::Insert => b"\x1b[2~".to_vec(),
+        KeyCode::Up => cursor_key(b'A'),
+        KeyCode::Down => cursor_key(b'B'),
+        KeyCode::Right => cursor_key(b'C'),
+        KeyCode::Left => cursor_key(b'D'),
+        KeyCode::Home => cursor_key(b'H'),
+        KeyCode::End => cursor_key(b'F'),
+        KeyCode::Insert => tilde_key(2),
+        KeyCode::Delete => tilde_key(3),
+        KeyCode::PageUp => tilde_key(5),
+        KeyCode::PageDown => tilde_key(6),
+        KeyCode::F(n @ 1..=4) => {
+            // F1–F4 are SS3 keys (`ESC O P`..`ESC O S`) unless modified.
+            let last = b'P' + (n - 1);
+            if modified {
+                format!("\x1b[1;{m}{}", last as char).into_bytes()
+            } else {
+                vec![0x1b, b'O', last]
+            }
+        }
+        KeyCode::F(n @ 5..=12) => {
+            // xterm's numbering, which is not contiguous.
+            const CODES: [u8; 8] = [15, 17, 18, 19, 20, 21, 23, 24];
+            tilde_key(CODES[(n - 5) as usize])
+        }
         _ => return None,
     };
     Some(bytes)
+}
+
+/// The C0 control byte a `Ctrl+<c>` chord produces, following xterm.
+fn ctrl_byte(c: char) -> Option<u8> {
+    match c {
+        'a'..='z' => Some(c as u8 - b'a' + 1),
+        'A'..='Z' => Some(c as u8 - b'A' + 1),
+        '@' | ' ' | '2' => Some(0),
+        '[' | '3' => Some(0x1b),
+        '\\' | '4' => Some(0x1c),
+        ']' | '5' => Some(0x1d),
+        '^' | '6' => Some(0x1e),
+        '_' | '7' | '/' => Some(0x1f),
+        '?' | '8' => Some(0x7f),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -207,17 +292,86 @@ mod tests {
         assert!(parse_command(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::NONE)).is_none());
     }
 
+    const PLAIN: KeyMode = KeyMode { kitty: false, app_cursor: false };
+    const KITTY: KeyMode = KeyMode { kitty: true, app_cursor: false };
+    const APPCUR: KeyMode = KeyMode { kitty: false, app_cursor: true };
+
     #[test]
     fn encodes_control_and_arrows() {
-        let ctrl_c = encode_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL), false);
+        let ctrl_c = encode_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL), PLAIN);
         assert_eq!(ctrl_c, Some(vec![0x03]));
         assert_eq!(
-            encode_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE), false),
+            encode_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE), PLAIN),
             Some(b"\x1b[A".to_vec())
         );
         assert_eq!(
-            encode_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), false),
+            encode_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), PLAIN),
             Some(vec![b'\r'])
+        );
+    }
+
+    /// Ctrl+Space is NUL and Ctrl+] is 0x1d — the old `& 0x1f` shortcut got the
+    /// letters right and everything else wrong.
+    #[test]
+    fn encodes_non_letter_control_chords() {
+        let ctrl = |c: char| encode_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL), PLAIN);
+        assert_eq!(ctrl(' '), Some(vec![0x00]));
+        assert_eq!(ctrl('['), Some(vec![0x1b]));
+        assert_eq!(ctrl(']'), Some(vec![0x1d]));
+        assert_eq!(ctrl('_'), Some(vec![0x1f]));
+        assert_eq!(ctrl('?'), Some(vec![0x7f]));
+        // A char with no control code is sent as itself, not a truncated byte.
+        assert_eq!(ctrl('é'), Some("é".as_bytes().to_vec()));
+    }
+
+    /// Modified cursor keys must carry the modifier, or Ctrl+Right (word jump)
+    /// arrives as a plain Right and silently does the wrong thing.
+    #[test]
+    fn modified_cursor_keys_carry_the_modifier() {
+        assert_eq!(
+            encode_key(KeyEvent::new(KeyCode::Right, KeyModifiers::CONTROL), PLAIN),
+            Some(b"\x1b[1;5C".to_vec())
+        );
+        assert_eq!(
+            encode_key(KeyEvent::new(KeyCode::Left, KeyModifiers::ALT), PLAIN),
+            Some(b"\x1b[1;3D".to_vec())
+        );
+        assert_eq!(
+            encode_key(KeyEvent::new(KeyCode::Delete, KeyModifiers::SHIFT), PLAIN),
+            Some(b"\x1b[3;2~".to_vec())
+        );
+    }
+
+    /// DECCKM swaps arrows to SS3; modified arrows keep the CSI form either way.
+    #[test]
+    fn application_cursor_mode_uses_ss3() {
+        assert_eq!(
+            encode_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE), APPCUR),
+            Some(b"\x1bOA".to_vec())
+        );
+        assert_eq!(
+            encode_key(KeyEvent::new(KeyCode::Home, KeyModifiers::NONE), APPCUR),
+            Some(b"\x1bOH".to_vec())
+        );
+        assert_eq!(
+            encode_key(KeyEvent::new(KeyCode::Up, KeyModifiers::CONTROL), APPCUR),
+            Some(b"\x1b[1;5A".to_vec())
+        );
+    }
+
+    #[test]
+    fn encodes_function_keys() {
+        assert_eq!(
+            encode_key(KeyEvent::new(KeyCode::F(1), KeyModifiers::NONE), PLAIN),
+            Some(b"\x1bOP".to_vec())
+        );
+        assert_eq!(
+            encode_key(KeyEvent::new(KeyCode::F(5), KeyModifiers::NONE), PLAIN),
+            Some(b"\x1b[15~".to_vec())
+        );
+        assert_eq!(
+            encode_key(KeyEvent::new(KeyCode::F(12), KeyModifiers::NONE), PLAIN),
+            Some(b"\x1b[24~".to_vec())
         );
     }
 
@@ -226,16 +380,16 @@ mod tests {
         let shift_enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT);
         // Without the Kitty protocol there is no way to express it — falls back
         // to a bare Enter (the pre-existing, unavoidable behaviour).
-        assert_eq!(encode_key(shift_enter, false), Some(vec![b'\r']));
+        assert_eq!(encode_key(shift_enter, PLAIN), Some(vec![b'\r']));
         // With it, Shift+Enter becomes the CSI-u form apps read as a newline.
-        assert_eq!(encode_key(shift_enter, true), Some(b"\x1b[13;2u".to_vec()));
+        assert_eq!(encode_key(shift_enter, KITTY), Some(b"\x1b[13;2u".to_vec()));
     }
 
     #[test]
     fn kitty_mode_leaves_plain_enter_alone() {
         // A bare Enter must still submit even in Kitty mode.
         assert_eq!(
-            encode_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), true),
+            encode_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), KITTY),
             Some(vec![b'\r'])
         );
     }
@@ -244,11 +398,11 @@ mod tests {
     fn kitty_mode_encodes_modifier_combos() {
         // Ctrl+Enter = 1+4 = 5; Alt+Enter = 1+2 = 3.
         assert_eq!(
-            encode_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL), true),
+            encode_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL), KITTY),
             Some(b"\x1b[13;5u".to_vec())
         );
         assert_eq!(
-            encode_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT), true),
+            encode_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT), KITTY),
             Some(b"\x1b[13;3u".to_vec())
         );
     }

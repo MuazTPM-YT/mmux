@@ -29,6 +29,10 @@ pub enum Nav {
     Renamed(String),
 }
 
+/// Session names are capped at this length by `session::sanitize`, so there is
+/// no point letting the input field grow past it.
+const MAX_NAME: usize = 64;
+
 /// An in-progress inline edit. `target = Some(old)` renames; `None` creates.
 pub struct Edit {
     input: String,
@@ -132,7 +136,9 @@ pub fn handle_key(ov: &mut Overlay, key: KeyEvent, current: &str) -> Nav {
                     }
                     KeyCode::Char(c) => {
                         if let Some(e) = editing {
-                            e.input.push(c);
+                            if e.input.chars().count() < MAX_NAME {
+                                e.input.push(c);
+                            }
                         }
                         Nav::Stay
                     }
@@ -212,9 +218,11 @@ pub fn handle_key(ov: &mut Overlay, key: KeyEvent, current: &str) -> Nav {
                 Nav::Stay
             }
             KeyCode::Char(c) => {
-                query.push(c);
-                *results = filter(query);
-                *sel = 0;
+                if query.chars().count() < MAX_NAME {
+                    query.push(c);
+                    *results = filter(query);
+                    *sel = 0;
+                }
                 Nav::Stay
             }
             _ => Nav::Stay,

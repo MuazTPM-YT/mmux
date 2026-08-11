@@ -5,11 +5,15 @@
 //! a detached daemon.
 
 use crossterm::event::{Event, KeyEvent, KeyEventKind};
-use tokio::sync::mpsc::UnboundedReceiver;
+use tokio::sync::mpsc::Receiver;
 
-use crate::keys::{self, Action};
+use crate::keys::{self, Action, KeyMode};
 use crate::pty::PtyEvent;
 use crate::state::Manager;
+
+/// Longest Space name the rename field accepts, so a stuck key can't grow the
+/// buffer without bound.
+const MAX_SPACE_NAME: usize = 64;
 
 /// Input mode: normal command/passthrough, or capturing a new Space name.
 pub enum Mode {
@@ -20,11 +24,11 @@ pub enum Mode {
 pub struct App {
     pub(crate) mgr: Manager,
     pub(crate) mode: Mode,
-    rx: UnboundedReceiver<PtyEvent>,
+    rx: Receiver<PtyEvent>,
 }
 
 impl App {
-    pub fn new(mgr: Manager, rx: UnboundedReceiver<PtyEvent>) -> Self {
+    pub fn new(mgr: Manager, rx: Receiver<PtyEvent>) -> Self {
         App {
             mgr,
             mode: Mode::Normal,
@@ -50,8 +54,13 @@ impl App {
         }
     }
 
-    /// Reconcile each pane's PTY + screen size with its last rendered content rect.
-    pub(crate) fn sync_sizes(&mut self) {
+    /// Reconcile each pane's PTY + screen size with its last rendered content
+    /// rect. Returns `true` if any pane was actually resized, which means the
+    /// frame that was just drawn used the *old* grid shape and has to be redrawn
+    /// — otherwise a resized pane keeps showing mis-shaped content until its
+    /// shell happens to print something.
+    pub(crate) fn sync_sizes(&mut self) -> bool {
+        let mut changed = false;
         for pane in self.mgr.panes.values_mut() {
             let (w, h) = (pane.rect.width, pane.rect.height);
             if w == 0 || h == 0 {
@@ -60,8 +69,10 @@ impl App {
             if w != pane.screen.cols || h != pane.screen.rows {
                 pane.screen.resize(w, h);
                 pane.process.resize(w, h);
+                changed = true;
             }
         }
+        changed
     }
 
     /// Handle one terminal event. Returns `true` if the UI needs to be redrawn.
@@ -91,8 +102,11 @@ impl App {
             true
         } else {
             if let Some(pane) = self.mgr.focused_pane_mut() {
-                let kitty = pane.screen.kitty_keyboard != 0;
-                if let Some(bytes) = keys::encode_key(key, kitty) {
+                let mode = KeyMode {
+                    kitty: pane.screen.kitty_keyboard != 0,
+                    app_cursor: pane.screen.app_cursor_keys,
+                };
+                if let Some(bytes) = keys::encode_key(key, mode) {
                     pane.process.write(&bytes);
                 }
             }
@@ -130,7 +144,9 @@ impl App {
             }
             KeyCode::Char(c) => {
                 if let Mode::Rename(buf) = &mut self.mode {
-                    buf.push(c);
+                    if buf.chars().count() < MAX_SPACE_NAME {
+                        buf.push(c);
+                    }
                 }
             }
             _ => {}

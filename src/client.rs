@@ -14,9 +14,9 @@ use std::time::Duration;
 
 use anyhow::{anyhow, Result};
 use crossterm::event::{
-    DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyEventKind,
-    KeyModifiers, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
-    PushKeyboardEnhancementFlags,
+    DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture, Event,
+    KeyCode, KeyEvent, KeyEventKind, KeyModifiers, KeyboardEnhancementFlags,
+    PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 use crossterm::execute;
 use crossterm::terminal::{
@@ -27,7 +27,7 @@ use ratatui::Terminal;
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::UnixStream;
 
-use crate::protocol::{read_msg, write_msg, ClientMsg, ServerMsg, WireKey};
+use crate::protocol::{read_msg, write_msg, ClientMsg, ServerMsg, WireKey, WireMouse};
 use crate::session;
 
 mod overlay;
@@ -188,6 +188,16 @@ async fn drive(mut session: String) -> Result<()> {
                             term.draw(|f| overlay::render(f, ov, &session))?;
                         }
                     }
+                    // The switcher owns the screen while it is up, so mouse
+                    // events there would act on a layout the user can't see.
+                    Some(Event::Mouse(m)) if overlay.is_none() => {
+                        if write_msg(&mut conn.writer, &ClientMsg::Mouse(WireMouse::from_event(m)))
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
                     Some(Event::Paste(text)) => {
                         // Ignore pastes while an overlay owns the screen; otherwise
                         // forward to the session, which routes it to the focused pane.
@@ -235,7 +245,18 @@ fn setup_terminal() -> Result<()> {
     // handles pastes safely — without it, terminals like Ghostty warn on every
     // paste containing control codes, because unbracketed pastes are injected as
     // raw keystrokes. It also makes crossterm coalesce pastes into `Event::Paste`.
-    execute!(stdout, EnterAlternateScreen, EnableBracketedPaste)?;
+    //
+    // EnableMouseCapture routes clicks and the wheel to mmux, which focuses
+    // panes, drags split seams, and scrolls scrollback — forwarding the event to
+    // the pane's app when that app asked for tracking. Holding Shift bypasses
+    // reporting in every terminal, so the outer terminal's own select-and-copy
+    // keeps working; that is why mmux does not implement its own selection.
+    execute!(
+        stdout,
+        EnterAlternateScreen,
+        EnableBracketedPaste,
+        EnableMouseCapture
+    )?;
     // Ask the outer terminal to disambiguate escape codes (Kitty keyboard
     // protocol). Without this, terminals fold Shift+Enter into a bare `\r`, so
     // the modifier never reaches mmux and apps like Claude Code can't tell the
@@ -253,6 +274,7 @@ fn restore_terminal() -> Result<()> {
     let mut stdout = io::stdout();
     let _ = write!(stdout, "\x1b[?25h");
     let _ = execute!(stdout, PopKeyboardEnhancementFlags);
+    let _ = execute!(stdout, DisableMouseCapture);
     let _ = execute!(stdout, DisableBracketedPaste);
     execute!(stdout, LeaveAlternateScreen)?;
     disable_raw_mode()?;

@@ -8,6 +8,8 @@
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
+use crate::protocol::{MouseAction, MouseButton, WireMouse};
+use crate::screen::{MouseLevel, MouseTracking};
 use crate::state::Direction;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -22,6 +24,8 @@ pub enum Action {
     SwitchSpace(usize),
     PrevSpace,
     NextSpace,
+    /// Enter keyboard scrollback navigation on the focused pane.
+    EnterScroll,
 }
 
 /// Recognise an `Alt` master-prefix command. Returns `None` for anything that
@@ -61,6 +65,15 @@ pub fn parse_command(key: KeyEvent) -> Option<Action> {
         KeyCode::Char(c) if ('1'..='9').contains(&c) => {
             Some(Action::SwitchSpace(c as usize - '1' as usize))
         }
+        // Scrollback ("copy mode"), for when there is no mouse to hand.
+        //
+        // `Alt+[` is the tmux-shaped binding, but it is only reliable on
+        // terminals that speak the Kitty keyboard protocol: the legacy encoding
+        // of Alt+[ is `ESC [`, which *is* the CSI introducer, so a terminal
+        // without disambiguation cannot tell the chord from the start of an
+        // escape sequence. `Alt+PageUp` has no such ambiguity and works
+        // everywhere, so both are bound.
+        KeyCode::Char('[') | KeyCode::PageUp => Some(Action::EnterScroll),
         KeyCode::Char(c) => shifted_digit(c).map(Action::SwitchSpace),
         KeyCode::Left => Some(Action::PrevSpace),
         KeyCode::Right => Some(Action::NextSpace),
@@ -205,6 +218,75 @@ pub fn encode_key(key: KeyEvent, mode: KeyMode) -> Option<Vec<u8>> {
         _ => return None,
     };
     Some(bytes)
+}
+
+/// Encode a mouse event for an app that asked for tracking, or `None` if this
+/// event isn't one the app wants.
+///
+/// Two wire formats exist and apps choose with DECSET 1006. SGR (`CSI < b;x;y M`)
+/// is unbounded and distinguishes press from release by its final byte; the
+/// legacy X10 form packs everything into single bytes offset by 32, which cannot
+/// address past column 223 — so anything beyond that is dropped rather than
+/// reported at a wrong position.
+pub fn encode_mouse(ev: &WireMouse, col: u16, row: u16, track: MouseTracking) -> Option<Vec<u8>> {
+    let level = track.level;
+    if level == MouseLevel::Off {
+        return None;
+    }
+    // Motion without a button held is only wanted at the highest level; drags
+    // need at least `Drag`.
+    match ev.kind {
+        MouseAction::Moved if level < MouseLevel::Motion => return None,
+        MouseAction::Drag if level < MouseLevel::Drag => return None,
+        _ => {}
+    }
+
+    let mut code: u8 = match ev.kind {
+        MouseAction::ScrollUp => 64,
+        MouseAction::ScrollDown => 65,
+        MouseAction::ScrollLeft => 66,
+        MouseAction::ScrollRight => 67,
+        MouseAction::Moved => 35, // motion with no button
+        _ => match ev.button {
+            MouseButton::Left => 0,
+            MouseButton::Middle => 1,
+            MouseButton::Right => 2,
+            MouseButton::None => 3,
+        },
+    };
+    if matches!(ev.kind, MouseAction::Drag) {
+        code += 32; // motion flag
+    }
+    if ev.mods & 1 != 0 {
+        code += 4; // shift
+    }
+    if ev.mods & 4 != 0 {
+        code += 8; // alt (meta)
+    }
+    if ev.mods & 2 != 0 {
+        code += 16; // ctrl
+    }
+
+    let release = matches!(ev.kind, MouseAction::Up);
+    if track.sgr {
+        let final_byte = if release { 'm' } else { 'M' };
+        return Some(
+            format!("\x1b[<{code};{};{}{final_byte}", col + 1, row + 1).into_bytes(),
+        );
+    }
+    // Legacy X10: a released button is reported as button 3.
+    let code = if release { (code & !3) | 3 } else { code };
+    if col >= 223 || row >= 223 {
+        return None;
+    }
+    Some(vec![
+        0x1b,
+        b'[',
+        b'M',
+        32 + code,
+        32 + col as u8 + 1,
+        32 + row as u8 + 1,
+    ])
 }
 
 /// The C0 control byte a `Ctrl+<c>` chord produces, following xterm.
@@ -373,6 +455,107 @@ mod tests {
             encode_key(KeyEvent::new(KeyCode::F(12), KeyModifiers::NONE), PLAIN),
             Some(b"\x1b[24~".to_vec())
         );
+    }
+
+    // ---- mouse -------------------------------------------------------------
+
+    fn mouse(kind: MouseAction, button: MouseButton) -> WireMouse {
+        WireMouse { kind, button, col: 0, row: 0, mods: 0 }
+    }
+
+    const SGR: MouseTracking = MouseTracking { level: MouseLevel::Click, sgr: true };
+    const X10: MouseTracking = MouseTracking { level: MouseLevel::Click, sgr: false };
+
+    #[test]
+    fn an_app_without_tracking_gets_no_mouse_bytes() {
+        let off = MouseTracking { level: MouseLevel::Off, sgr: false };
+        assert_eq!(
+            encode_mouse(&mouse(MouseAction::Down, MouseButton::Left), 3, 4, off),
+            None
+        );
+    }
+
+    /// SGR distinguishes press from release by its final byte, and reports
+    /// 1-based coordinates.
+    #[test]
+    fn sgr_mouse_encoding() {
+        let down = mouse(MouseAction::Down, MouseButton::Left);
+        assert_eq!(
+            encode_mouse(&down, 10, 5, SGR),
+            Some(b"\x1b[<0;11;6M".to_vec())
+        );
+        let up = mouse(MouseAction::Up, MouseButton::Left);
+        assert_eq!(encode_mouse(&up, 10, 5, SGR), Some(b"\x1b[<0;11;6m".to_vec()));
+        let right = mouse(MouseAction::Down, MouseButton::Right);
+        assert_eq!(
+            encode_mouse(&right, 0, 0, SGR),
+            Some(b"\x1b[<2;1;1M".to_vec())
+        );
+    }
+
+    #[test]
+    fn sgr_wheel_and_modifiers() {
+        let mut up = mouse(MouseAction::ScrollUp, MouseButton::None);
+        assert_eq!(encode_mouse(&up, 0, 0, SGR), Some(b"\x1b[<64;1;1M".to_vec()));
+        let down = mouse(MouseAction::ScrollDown, MouseButton::None);
+        assert_eq!(encode_mouse(&down, 0, 0, SGR), Some(b"\x1b[<65;1;1M".to_vec()));
+        // Ctrl adds 16, shift 4, alt 8.
+        up.mods = 2;
+        assert_eq!(encode_mouse(&up, 0, 0, SGR), Some(b"\x1b[<80;1;1M".to_vec()));
+    }
+
+    #[test]
+    fn legacy_x10_mouse_encoding() {
+        let down = mouse(MouseAction::Down, MouseButton::Left);
+        assert_eq!(
+            encode_mouse(&down, 10, 5, X10),
+            Some(vec![0x1b, b'[', b'M', 32, 32 + 11, 32 + 6])
+        );
+        // Release is reported as button 3 in the legacy form.
+        let up = mouse(MouseAction::Up, MouseButton::Left);
+        assert_eq!(
+            encode_mouse(&up, 10, 5, X10),
+            Some(vec![0x1b, b'[', b'M', 32 + 3, 32 + 11, 32 + 6])
+        );
+        // Past column 223 the legacy form cannot address the cell; report
+        // nothing rather than the wrong position.
+        assert_eq!(encode_mouse(&down, 300, 5, X10), None);
+    }
+
+    /// Motion and drag events only reach apps that asked for those levels.
+    #[test]
+    fn motion_events_respect_the_tracking_level() {
+        let drag = mouse(MouseAction::Drag, MouseButton::Left);
+        let moved = mouse(MouseAction::Moved, MouseButton::None);
+        assert_eq!(encode_mouse(&drag, 1, 1, SGR), None, "click-only: no drags");
+        assert_eq!(encode_mouse(&moved, 1, 1, SGR), None);
+
+        let drag_lvl = MouseTracking { level: MouseLevel::Drag, sgr: true };
+        // Drag carries the +32 motion flag on top of button 0.
+        assert_eq!(
+            encode_mouse(&drag, 1, 1, drag_lvl),
+            Some(b"\x1b[<32;2;2M".to_vec())
+        );
+        assert_eq!(encode_mouse(&moved, 1, 1, drag_lvl), None, "still no bare motion");
+
+        let motion_lvl = MouseTracking { level: MouseLevel::Motion, sgr: true };
+        assert_eq!(
+            encode_mouse(&moved, 1, 1, motion_lvl),
+            Some(b"\x1b[<35;2;2M".to_vec())
+        );
+    }
+
+    #[test]
+    fn scrollback_has_an_unambiguous_binding() {
+        // Alt+[ only survives on terminals with escape-code disambiguation,
+        // because its legacy form `ESC [` is the CSI introducer.
+        assert_eq!(parse_command(alt('[')), Some(Action::EnterScroll));
+        assert_eq!(
+            parse_command(KeyEvent::new(KeyCode::PageUp, ALT)),
+            Some(Action::EnterScroll)
+        );
+        // Without Alt, PageUp is ordinary input for the shell.
+        assert!(parse_command(KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE)).is_none());
     }
 
     #[test]

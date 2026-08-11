@@ -68,7 +68,21 @@ KEYS (prefix = Alt):
     Alt+W/A/S/D           New pane up/left/down/right
     Alt+q                 Close pane      Alt+t  New space     Alt+r  Rename space
     Alt+1..9              Switch space    Alt+left/right  Cycle spaces
-    Alt+Enter             Detach session",
+    Alt+Enter             Detach session
+
+SCROLLBACK (10000 lines per pane):
+    Mouse wheel           Scroll history; typing returns to live output
+    Alt+PageUp, Alt+[     Keyboard scroll mode
+      w/s or up/down      Line      PageUp/PageDown  Page
+      g / G               Oldest / live             Esc  Exit
+
+MOUSE:
+    Click                 Focus the pane under the pointer
+    Drag a pane border    Resize the split
+    Shift+drag            Bypasses mmux — your terminal's own select and copy
+
+    Apps that request mouse tracking (vim, htop, fzf) receive clicks and the
+    wheel directly.",
         ver = env!("CARGO_PKG_VERSION")
     );
 }

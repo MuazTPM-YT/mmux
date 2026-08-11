@@ -8,23 +8,30 @@ use crossterm::event::{Event, KeyEvent, KeyEventKind};
 use tokio::sync::mpsc::Receiver;
 
 use crate::keys::{self, Action, KeyMode};
+use crate::protocol::{MouseAction, WireMouse};
 use crate::pty::PtyEvent;
 use crate::state::Manager;
 
 /// Longest Space name the rename field accepts, so a stuck key can't grow the
 /// buffer without bound.
 const MAX_SPACE_NAME: usize = 64;
+/// Lines the wheel moves per notch, matching what terminals normally do.
+const SCROLL_LINES: isize = 3;
 
-/// Input mode: normal command/passthrough, or capturing a new Space name.
+/// Input mode: normal command/passthrough, capturing a new Space name, or
+/// navigating the focused pane's scrollback from the keyboard.
 pub enum Mode {
     Normal,
     Rename(String),
+    Scroll,
 }
 
 pub struct App {
     pub(crate) mgr: Manager,
     pub(crate) mode: Mode,
     rx: Receiver<PtyEvent>,
+    /// The split seam a mouse drag grabbed, held until the button is released.
+    dragging: Option<crate::state::Divider>,
 }
 
 impl App {
@@ -33,6 +40,7 @@ impl App {
             mgr,
             mode: Mode::Normal,
             rx,
+            dragging: None,
         }
     }
 
@@ -85,6 +93,7 @@ impl App {
                 }
                 match &mut self.mode {
                     Mode::Rename(_) => self.handle_rename_key(key),
+                    Mode::Scroll => self.handle_scroll_key(key),
                     Mode::Normal => self.handle_normal_key(key),
                 }
             }
@@ -106,12 +115,131 @@ impl App {
                     kitty: pane.screen.kitty_keyboard != 0,
                     app_cursor: pane.screen.app_cursor_keys,
                 };
+                // Typing means you want to be back at the prompt, not reading
+                // history — same reflex every terminal has.
+                let snapped = pane.screen.scroll_to_live();
                 if let Some(bytes) = keys::encode_key(key, mode) {
                     pane.process.write(&bytes);
                 }
+                return snapped;
             }
             false
         }
+    }
+
+    /// Keyboard scrollback navigation (`Alt+[`). Any key that isn't a movement
+    /// leaves the mode, so there is no way to get stuck in it.
+    fn handle_scroll_key(&mut self, key: KeyEvent) -> bool {
+        use crossterm::event::KeyCode;
+        let page = self
+            .mgr
+            .focused_pane_mut()
+            .map(|p| p.screen.rows.saturating_sub(1).max(1) as isize)
+            .unwrap_or(1);
+        let Some(pane) = self.mgr.focused_pane_mut() else {
+            self.mode = Mode::Normal;
+            return true;
+        };
+        match key.code {
+            KeyCode::Up | KeyCode::Char('w') | KeyCode::Char('k') => {
+                pane.screen.scroll_view(-1);
+            }
+            KeyCode::Down | KeyCode::Char('s') | KeyCode::Char('j') => {
+                pane.screen.scroll_view(1);
+            }
+            KeyCode::PageUp | KeyCode::Char('b') => {
+                pane.screen.scroll_view(-page);
+            }
+            KeyCode::PageDown | KeyCode::Char(' ') | KeyCode::Char('f') => {
+                pane.screen.scroll_view(page);
+            }
+            KeyCode::Home | KeyCode::Char('g') => {
+                let top = pane.screen.scrollback_len();
+                pane.screen.scroll_view_to(top);
+            }
+            KeyCode::End | KeyCode::Char('G') => {
+                pane.screen.scroll_to_live();
+            }
+            // Anything else exits, snapping back to live output.
+            _ => {
+                pane.screen.scroll_to_live();
+                self.mode = Mode::Normal;
+            }
+        }
+        true
+    }
+
+    /// Handle one mouse event. Returns `true` if the UI needs redrawing.
+    ///
+    /// Routing rule: an event belongs to the pane's application whenever that
+    /// application asked for mouse tracking, **except** wheel events while the
+    /// view is scrolled back — otherwise you could never scroll out of history.
+    /// Everything an app doesn't want becomes an mmux gesture: click to focus,
+    /// drag a seam to resize, wheel to scroll history.
+    pub(crate) fn handle_mouse(&mut self, ev: &WireMouse) -> bool {
+        if !matches!(self.mode, Mode::Normal | Mode::Scroll) {
+            return false;
+        }
+
+        // A drag in progress owns every event until the button comes up.
+        if let Some(d) = self.dragging {
+            return match ev.kind {
+                MouseAction::Drag => self.mgr.drag_divider(&d, ev.col, ev.row),
+                MouseAction::Up => {
+                    self.dragging = None;
+                    false
+                }
+                _ => false,
+            };
+        }
+
+        // Grabbing a seam takes precedence over the panes either side of it.
+        if matches!(ev.kind, MouseAction::Down) {
+            if let Some(d) = self.mgr.divider_at(ev.col, ev.row) {
+                self.dragging = Some(d);
+                return false;
+            }
+        }
+
+        let Some(id) = self.mgr.pane_at(ev.col, ev.row) else {
+            return false;
+        };
+
+        // Clicking a pane focuses it, whether or not the app also wants the
+        // click — otherwise a click inside vim would leave focus elsewhere.
+        let mut redraw = false;
+        if matches!(ev.kind, MouseAction::Down) {
+            redraw |= self.mgr.focus_pane(id);
+        }
+
+        let Some(pane) = self.mgr.panes.get_mut(&id) else {
+            return redraw;
+        };
+        let scrolled_back = pane.screen.view_offset > 0;
+
+        if pane.screen.mouse.enabled() && !(ev.is_scroll() && scrolled_back) {
+            // Translate to pane-local coordinates before handing it over.
+            let (Some(col), Some(row)) = (
+                ev.col.checked_sub(pane.rect.x),
+                ev.row.checked_sub(pane.rect.y),
+            ) else {
+                return redraw;
+            };
+            if col < pane.rect.width && row < pane.rect.height {
+                if let Some(bytes) = keys::encode_mouse(ev, col, row, pane.screen.mouse) {
+                    pane.process.write(&bytes);
+                }
+            }
+            return redraw;
+        }
+
+        // mmux's own gesture: the wheel walks scrollback.
+        match ev.kind {
+            MouseAction::ScrollUp => redraw |= pane.screen.scroll_view(-SCROLL_LINES),
+            MouseAction::ScrollDown => redraw |= pane.screen.scroll_view(SCROLL_LINES),
+            _ => {}
+        }
+        redraw
     }
 
     /// Forward pasted text to the focused pane's shell. Like a forwarded
@@ -173,6 +301,20 @@ impl App {
             Action::SwitchSpace(i) => self.mgr.switch_to(i),
             Action::PrevSpace => self.mgr.prev_space(),
             Action::NextSpace => self.mgr.next_space(),
+            Action::EnterScroll => {
+                // Pointless on a pane with no history, and on the alternate
+                // screen the app owns scrolling anyway.
+                let Some(pane) = self.mgr.focused_pane_mut() else {
+                    return;
+                };
+                if pane.screen.scrollback_len() > 0 {
+                    // Page back on entry: the mode is only useful once you can
+                    // see history, and it makes the keypress visibly do something.
+                    let page = pane.screen.rows.saturating_sub(1).max(1) as isize;
+                    pane.screen.scroll_view(-page);
+                    self.mode = Mode::Scroll;
+                }
+            }
         }
     }
 

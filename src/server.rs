@@ -237,6 +237,11 @@ pub async fn run(mut name: String) -> Result<()> {
                             }
                         }
                     }
+                    Ok(ClientMsg::Mouse(m)) => {
+                        if app.handle_mouse(&m) {
+                            dirty = true;
+                        }
+                    }
                     Ok(ClientMsg::Paste(text)) => app.paste(&text),
                     Ok(ClientMsg::Shutdown) => shutdown = true,
                     Ok(ClientMsg::Rename(new)) => rename_to = Some(new),

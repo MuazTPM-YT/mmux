@@ -56,12 +56,14 @@ fn draw_tabs(f: &mut Frame, mgr: &Manager, session: &str, area: Rect) {
 }
 
 fn draw_panes(f: &mut Frame, mgr: &mut Manager, area: Rect) {
-    // Snapshot the leaf rects, then release the immutable borrow on `mgr`.
+    // Snapshot the leaf rects and split seams, then release the borrow on `mgr`.
     let mut rects: Vec<(u64, Rect)> = Vec::new();
+    let mut dividers = Vec::new();
     let Some(space) = mgr.active_space() else {
         return;
     };
-    space.root.compute_rects(area, &mut rects);
+    space.root.compute_layout(area, &mut rects, &mut dividers);
+    mgr.dividers = dividers;
     let focused = mgr.focused_id();
 
     for (id, outer) in rects {
@@ -70,7 +72,11 @@ fn draw_panes(f: &mut Frame, mgr: &mut Manager, area: Rect) {
             continue;
         };
 
-        let border_style = if is_focused {
+        // A scrolled-back pane gets a yellow frame: the strongest possible hint
+        // that what you are looking at is history, not live output.
+        let border_style = if pane.screen.view_offset > 0 {
+            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+        } else if is_focused {
             Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
         } else {
             Style::default().fg(Color::DarkGray)
@@ -83,8 +89,9 @@ fn draw_panes(f: &mut Frame, mgr: &mut Manager, area: Rect) {
         let inner = block.inner(outer);
         f.render_widget(block, outer);
 
-        // Record the content rect for focus navigation and PTY resize.
+        // Record the rects for focus navigation, PTY resize and mouse hit-testing.
         pane.rect = inner;
+        pane.outer = outer;
 
         blit_screen(f, &pane.screen, inner, is_focused);
     }
@@ -99,8 +106,9 @@ fn draw_panes(f: &mut Frame, mgr: &mut Manager, area: Rect) {
 fn blit_screen(f: &mut Frame, screen: &crate::screen::Screen, inner: Rect, focused: bool) {
     // Park the cursor on the left half of a wide glyph, never on its
     // continuation cell — otherwise the block lands on a column the terminal
-    // never draws separately.
-    let cursor = (focused && screen.cursor_visible).then(|| {
+    // never draws separately. A scrolled-back view shows no cursor: it belongs
+    // to the live screen, which isn't what's on display.
+    let cursor = (focused && screen.cursor_visible && screen.view_offset == 0).then(|| {
         let cx = match screen.cell(screen.cx, screen.cy) {
             Some(c) if c.width == 0 => screen.cx.saturating_sub(1),
             _ => screen.cx,
@@ -114,7 +122,7 @@ fn blit_screen(f: &mut Frame, screen: &crate::screen::Screen, inner: Rect, focus
             let Some(dst) = buf.cell_mut((inner.x + x, inner.y + y)) else {
                 continue;
             };
-            let Some(sc) = screen.cell(x, y) else {
+            let Some(sc) = screen.view_cell(x, y) else {
                 dst.set_char(' ');
                 dst.set_style(Style::default());
                 continue;
@@ -178,13 +186,52 @@ fn draw_status(f: &mut Frame, mgr: &Manager, mode: &Mode, area: Rect) {
             ]);
             f.render_widget(Paragraph::new(line).style(bar), area);
         }
+        Mode::Scroll => {
+            let (at, total) = scroll_position(mgr);
+            let line = Line::from(vec![
+                Span::styled(
+                    format!(" SCROLL {at}/{total} "),
+                    Style::default().fg(Color::Black).bg(Color::Yellow).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    "  w/s line · PgUp/PgDn page · g top · G live · Esc exit ",
+                    Style::default().fg(Color::Yellow),
+                ),
+            ]);
+            f.render_widget(Paragraph::new(line), area);
+        }
         Mode::Normal => {
             let space = mgr.active_space().map(|s| s.name.as_str()).unwrap_or("");
+            // While the wheel has you scrolled back, the hint line is the wrong
+            // thing to show — say where you are instead.
+            let (at, total) = scroll_position(mgr);
+            if at > 0 {
+                let line = Line::from(vec![
+                    Span::styled(
+                        format!(" SCROLL {at}/{total} "),
+                        Style::default().fg(Color::Black).bg(Color::Yellow).add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(
+                        "  wheel or Alt+PgUp to move · type to return to live ",
+                        Style::default().fg(Color::Yellow),
+                    ),
+                ]);
+                f.render_widget(Paragraph::new(line), area);
+                return;
+            }
             let text = format!(
-                " [{space}]  Alt+wasd focus · Alt+WASD new pane · q close · t new · r rename · 1-9 space · ←/→ cycle "
+                " [{space}]  Alt+wasd focus · Alt+WASD new pane · q close · t new · r rename · PgUp scroll · 1-9 space "
             );
             let style = Style::default().fg(Color::Black).bg(Color::Cyan);
             f.render_widget(Paragraph::new(text).style(style), area);
         }
     }
+}
+
+/// How far the focused pane is scrolled back, and how much history it has.
+fn scroll_position(mgr: &Manager) -> (usize, usize) {
+    mgr.focused_id()
+        .and_then(|id| mgr.panes.get(&id))
+        .map(|p| (p.screen.view_offset, p.screen.scrollback_len()))
+        .unwrap_or((0, 0))
 }

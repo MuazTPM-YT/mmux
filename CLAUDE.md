@@ -37,7 +37,9 @@ which just connects and disconnects) never disturb the attached client.
 forwards input as `ClientMsg`. It intercepts only the global chords — `Alt+Enter`
 (detach), `Alt+.` (list), `Alt+/` (search) — and renders the switcher overlays
 itself (`client/overlay.rs`), repainting the session via `ClientMsg::Redraw` or
-reconnecting to another server on switch.
+reconnecting to another server on switch. It also enables mouse capture and ships
+events on as `ClientMsg::Mouse`; the server decides what they mean, because only
+it knows the layout.
 
 **Protocol (`protocol.rs`)** — length-prefixed postcard messages. `WireKey`
 mirrors a `crossterm::KeyEvent`; frames are raw escape bytes.
@@ -91,6 +93,25 @@ was a real, visible bug; keep them in mind when adding cases:
   Zero-width codepoints are dropped — one `char` per cell has nowhere to put them.
 - `38:2::r:g:b` (colon-form colour) is not the semicolon form; parsing it as
   such ate the following parameters.
+
+**Scrollback lives in `Screen`.** Lines enter `scrollback` only when they leave
+the **top of the primary screen** — never from a sub-region scroll (a TUI
+repainting part of its window) and never from the alternate screen, which is why
+`less` doesn't pollute your shell's history. `view_offset` is how far the *view*
+is scrolled back; the renderer reads `view_cell`, the emulator keeps writing
+through `cell`. Stored rows are trimmed of trailing blanks and keep their
+original width — a `Cell` is 20 bytes, so untrimmed full-width rows would cost
+~40 MB per pane at the 10 000-line cap. `view_cell` pads short rows back out.
+
+**Mouse routing (`App::handle_mouse`).** An event goes to the pane's application
+whenever that application enabled tracking (`Screen::mouse`), *except* wheel
+events while the view is scrolled back — otherwise there'd be no way to scroll
+back out of history. Everything else is an mmux gesture: click focuses a pane,
+dragging a `Divider` (captured during render, like `Pane::rect`) resizes a split,
+the wheel walks scrollback. Coordinates arrive in client-terminal space and are
+made pane-local before encoding. mmux deliberately implements **no text
+selection**: every terminal bypasses mouse reporting while Shift is held, so the
+outer terminal's own select-and-copy keeps working for free.
 
 **No render path may panic.** The server runs with `panic = "abort"`, so a panic
 kills the daemon and every shell in the session. `Manager::active_space` returns

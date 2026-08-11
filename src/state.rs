@@ -29,6 +29,8 @@ pub enum SplitDir {
 pub enum Node {
     Leaf(u64),
     Split {
+        /// Identity of this split, so a dragged divider can find it again.
+        id: u64,
         dir: SplitDir,
         /// Percentage of the parent given to child `a` (1..=99).
         ratio: u16,
@@ -36,6 +38,22 @@ pub enum Node {
         b: Box<Node>,
     },
 }
+
+/// The draggable seam between two panes, captured during a render.
+#[derive(Clone, Copy, Debug)]
+pub struct Divider {
+    /// The `Node::Split` this seam belongs to.
+    pub id: u64,
+    pub dir: SplitDir,
+    /// Cells that count as "on the divider" for hit-testing.
+    pub rect: Rect,
+    /// The split's whole area, needed to turn a drag position into a ratio.
+    pub area: Rect,
+}
+
+/// How far a split may be dragged, so a pane can never be squeezed to nothing.
+const MIN_RATIO: u16 = 10;
+const MAX_RATIO: u16 = 90;
 
 impl Node {
     fn first_leaf(&self) -> u64 {
@@ -88,11 +106,12 @@ impl Node {
                     Some(Node::Leaf(id))
                 }
             }
-            Node::Split { dir, ratio, a, b } => {
+            Node::Split { id, dir, ratio, a, b } => {
                 let a2 = a.remove_leaf(target);
                 let b2 = b.remove_leaf(target);
                 match (a2, b2) {
                     (Some(a), Some(b)) => Some(Node::Split {
+                        id,
                         dir,
                         ratio,
                         a: Box::new(a),
@@ -105,15 +124,53 @@ impl Node {
         }
     }
 
-    /// Compute the on-screen rectangle for every leaf within `area`.
-    pub fn compute_rects(&self, area: Rect, out: &mut Vec<(u64, Rect)>) {
+    /// Compute leaf rectangles and, alongside them, the draggable seam between
+    /// each split's children.
+    pub fn compute_layout(
+        &self,
+        area: Rect,
+        leaves: &mut Vec<(u64, Rect)>,
+        dividers: &mut Vec<Divider>,
+    ) {
         match self {
-            Node::Leaf(id) => out.push((*id, area)),
-            Node::Split { dir, ratio, a, b } => {
+            Node::Leaf(id) => leaves.push((*id, area)),
+            Node::Split { id, dir, ratio, a, b } => {
                 let (ra, rb) = split_rect(area, *dir, *ratio);
-                a.compute_rects(ra, out);
-                b.compute_rects(rb, out);
+                // The seam is the pair of adjacent borders the two children
+                // draw: `a`'s trailing edge and `b`'s leading edge. Two cells
+                // wide makes it comfortable to grab.
+                let rect = match dir {
+                    SplitDir::Horizontal => Rect {
+                        x: rb.x.saturating_sub(1),
+                        y: area.y,
+                        width: 2.min(area.width),
+                        height: area.height,
+                    },
+                    SplitDir::Vertical => Rect {
+                        x: area.x,
+                        y: rb.y.saturating_sub(1),
+                        width: area.width,
+                        height: 2.min(area.height),
+                    },
+                };
+                dividers.push(Divider { id: *id, dir: *dir, rect, area });
+                a.compute_layout(ra, leaves, dividers);
+                b.compute_layout(rb, leaves, dividers);
             }
+        }
+    }
+
+    /// Set the ratio of the split with this id. Returns true if it changed.
+    fn set_ratio(&mut self, target: u64, ratio: u16) -> bool {
+        match self {
+            Node::Leaf(_) => false,
+            Node::Split { id, ratio: r, .. } if *id == target => {
+                let want = ratio.clamp(MIN_RATIO, MAX_RATIO);
+                let changed = *r != want;
+                *r = want;
+                changed
+            }
+            Node::Split { a, b, .. } => a.set_ratio(target, ratio) || b.set_ratio(target, ratio),
         }
     }
 }
@@ -165,6 +222,9 @@ pub struct Pane {
     pub process: PtyProcess,
     /// Inner (content) rect from the last render — used for focus nav & resize.
     pub rect: Rect,
+    /// Outer rect including the border, for mouse hit-testing: clicking a pane's
+    /// frame should focus it, not fall through to whatever is behind.
+    pub outer: Rect,
 }
 
 impl Pane {
@@ -209,6 +269,9 @@ pub struct Manager {
     /// Bumped whenever the set of space *names* changes, so the server can skip
     /// re-persisting (and cloning every name) on the hot PTY-output path.
     spaces_gen: u64,
+    /// Split seams captured during the last render, for mouse hit-testing.
+    /// Like `Pane::rect`, these are only meaningful after a draw.
+    pub dividers: Vec<Divider>,
     tx: Sender<PtyEvent>,
 }
 
@@ -225,6 +288,7 @@ impl Manager {
             panes: HashMap::new(),
             next_id: 1,
             spaces_gen: 0,
+            dividers: Vec::new(),
             tx,
         };
         let names: Vec<String> = if space_names.is_empty() {
@@ -265,6 +329,7 @@ impl Manager {
                 parser: Parser::new(),
                 process,
                 rect: Rect::default(),
+                outer: Rect::default(),
             },
         );
         Ok(id)
@@ -317,7 +382,10 @@ impl Manager {
         } else {
             (Node::Leaf(target), Node::Leaf(new_id))
         };
+        let split_id = self.next_id;
+        self.next_id += 1;
         let repl = Node::Split {
+            id: split_id,
             dir: split_dir,
             ratio: 50,
             a: Box::new(a),
@@ -415,6 +483,53 @@ impl Manager {
         }
     }
 
+    /// The pane whose frame contains this screen position, if any. Only panes in
+    /// the active Space are considered — the others aren't on screen.
+    pub fn pane_at(&self, x: u16, y: u16) -> Option<u64> {
+        let mut ids = Vec::new();
+        self.active_space()?.root.leaves(&mut ids);
+        ids.into_iter()
+            .find(|id| self.panes.get(id).is_some_and(|p| contains(p.outer, x, y)))
+    }
+
+    /// The split seam under this position, if any.
+    pub fn divider_at(&self, x: u16, y: u16) -> Option<Divider> {
+        self.dividers
+            .iter()
+            .find(|d| contains(d.rect, x, y))
+            .copied()
+    }
+
+    /// Focus a specific pane. Returns `true` if focus moved.
+    pub fn focus_pane(&mut self, id: u64) -> bool {
+        let Some(space) = self.active_space_mut() else {
+            return false;
+        };
+        if space.focused == id {
+            return false;
+        }
+        space.focused = id;
+        true
+    }
+
+    /// Drag a split seam so it lands on `(x, y)`. Returns `true` if the layout
+    /// changed, i.e. whether a redraw is needed.
+    pub fn drag_divider(&mut self, d: &Divider, x: u16, y: u16) -> bool {
+        let (span, pos) = match d.dir {
+            SplitDir::Horizontal => (d.area.width, x.saturating_sub(d.area.x)),
+            SplitDir::Vertical => (d.area.height, y.saturating_sub(d.area.y)),
+        };
+        if span == 0 {
+            return false;
+        }
+        // +1 because the seam sits at the far edge of child `a`.
+        let ratio = ((pos as u32 + 1) * 100 / span as u32) as u16;
+        let Some(space) = self.active_space_mut() else {
+            return false;
+        };
+        space.root.set_ratio(d.id, ratio)
+    }
+
     /// Move focus to the nearest pane in a cardinal direction, using the rects
     /// captured at the last render.
     pub fn focus_dir(&mut self, dir: Direction) {
@@ -477,6 +592,11 @@ pub enum Direction {
     Right,
 }
 
+/// `Rect::contains` needs a `Position`; this keeps the call sites terse.
+fn contains(r: Rect, x: u16, y: u16) -> bool {
+    x >= r.x && x < r.x.saturating_add(r.width) && y >= r.y && y < r.y.saturating_add(r.height)
+}
+
 fn center(r: Rect) -> (i64, i64) {
     (
         r.x as i64 + r.width as i64 / 2,
@@ -490,18 +610,18 @@ mod tests {
     //! fiddly correctness lives.
     use super::*;
 
+    /// A split node with the given children; `id` only matters to divider drags.
+    fn split(id: u64, dir: SplitDir, a: Node, b: Node) -> Node {
+        Node::Split { id, dir, ratio: 50, a: Box::new(a), b: Box::new(b) }
+    }
+
     #[test]
     fn split_then_remove_collapses_tree() {
         // Start: Leaf(1). Split -> Split(Leaf(1), Leaf(2)).
         let mut root = Node::Leaf(1);
         root.replace_leaf(
             1,
-            Node::Split {
-                dir: SplitDir::Horizontal,
-                ratio: 50,
-                a: Box::new(Node::Leaf(1)),
-                b: Box::new(Node::Leaf(2)),
-            },
+            split(100, SplitDir::Horizontal, Node::Leaf(1), Node::Leaf(2)),
         );
         let mut leaves = Vec::new();
         root.leaves(&mut leaves);
@@ -538,21 +658,63 @@ mod tests {
     }
 
     #[test]
-    fn compute_rects_covers_all_leaves() {
-        let root = Node::Split {
-            dir: SplitDir::Horizontal,
-            ratio: 50,
-            a: Box::new(Node::Leaf(1)),
-            b: Box::new(Node::Split {
-                dir: SplitDir::Vertical,
-                ratio: 50,
-                a: Box::new(Node::Leaf(2)),
-                b: Box::new(Node::Leaf(3)),
-            }),
-        };
+    fn compute_layout_covers_all_leaves() {
+        let root = split(
+            100,
+            SplitDir::Horizontal,
+            Node::Leaf(1),
+            split(101, SplitDir::Vertical, Node::Leaf(2), Node::Leaf(3)),
+        );
         let mut rects = Vec::new();
-        root.compute_rects(Rect { x: 0, y: 0, width: 80, height: 24 }, &mut rects);
+        let mut dividers = Vec::new();
+        root.compute_layout(
+            Rect { x: 0, y: 0, width: 80, height: 24 },
+            &mut rects,
+            &mut dividers,
+        );
         let ids: Vec<u64> = rects.iter().map(|(id, _)| *id).collect();
         assert_eq!(ids, vec![1, 2, 3]);
+        // One seam per split, each carrying the area it divides.
+        assert_eq!(dividers.len(), 2);
+        assert_eq!(dividers[0].id, 100);
+        assert_eq!(dividers[0].dir, SplitDir::Horizontal);
+        assert_eq!(dividers[0].area.width, 80);
+    }
+
+    /// The seam sits on the two adjacent border columns/rows the children draw,
+    /// which is what makes it grabbable with a mouse.
+    #[test]
+    fn divider_straddles_the_boundary_between_children() {
+        let area = Rect { x: 0, y: 0, width: 80, height: 24 };
+        let root = split(7, SplitDir::Horizontal, Node::Leaf(1), Node::Leaf(2));
+        let (mut leaves, mut dividers) = (Vec::new(), Vec::new());
+        root.compute_layout(area, &mut leaves, &mut dividers);
+        let d = dividers[0];
+        // Child `b` starts at x=40, so the seam covers columns 39 and 40.
+        assert_eq!((d.rect.x, d.rect.width), (39, 2));
+        assert_eq!(d.rect.height, 24);
+    }
+
+    #[test]
+    fn dragging_a_divider_sets_the_ratio_and_clamps() {
+        let mut root = split(7, SplitDir::Horizontal, Node::Leaf(1), Node::Leaf(2));
+        assert!(root.set_ratio(7, 25));
+        match &root {
+            Node::Split { ratio, .. } => assert_eq!(*ratio, 25),
+            _ => panic!("expected a split"),
+        }
+        // Beyond the limits a pane would vanish, so the ratio is clamped.
+        root.set_ratio(7, 1);
+        match &root {
+            Node::Split { ratio, .. } => assert_eq!(*ratio, MIN_RATIO),
+            _ => panic!("expected a split"),
+        }
+        root.set_ratio(7, 99);
+        match &root {
+            Node::Split { ratio, .. } => assert_eq!(*ratio, MAX_RATIO),
+            _ => panic!("expected a split"),
+        }
+        // An unknown id changes nothing.
+        assert!(!root.set_ratio(999, 50));
     }
 }

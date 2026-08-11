@@ -24,6 +24,8 @@
 //!   emoji) occupies its own cell plus a zero-width *continuation* cell, so the
 //!   grid stays column-aligned with what the real terminal will draw.
 
+use std::collections::VecDeque;
+
 use ratatui::style::Color;
 use unicode_width::UnicodeWidthChar;
 use vte::{Params, Perform};
@@ -35,6 +37,42 @@ const MAX_TITLE: usize = 256;
 const MAX_RESPONSES: usize = 64 * 1024;
 /// Kitty's keyboard-protocol flag stack is explicitly bounded by the spec.
 const MAX_KITTY_STACK: usize = 16;
+/// Lines of scrollback kept per pane. At 200 columns this is ~14 MB worst case,
+/// and the deque drops the oldest line once full — the memory ceiling is fixed.
+pub const MAX_SCROLLBACK: usize = 10_000;
+
+/// Which mouse events the pane's app asked for, via DECSET 1000/1002/1003.
+///
+/// This is what decides whether a click belongs to the app or to mmux: an app
+/// that never enabled tracking has no use for the event, so mmux keeps it for
+/// pane focus and scrollback.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MouseTracking {
+    /// `?1000` press/release, `?1002` also drags, `?1003` also bare motion.
+    pub level: MouseLevel,
+    /// `?1006` SGR encoding. Without it we fall back to the legacy X10 form,
+    /// which cannot address columns past 223.
+    pub sgr: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
+pub enum MouseLevel {
+    #[default]
+    Off,
+    /// Button press and release only.
+    Click,
+    /// Press, release, and motion while a button is held.
+    Drag,
+    /// Every motion event, button or not.
+    Motion,
+}
+
+impl MouseTracking {
+    /// Does the app want events at all?
+    pub fn enabled(&self) -> bool {
+        self.level != MouseLevel::Off
+    }
+}
 
 /// A single character cell with its rendered attributes. `Copy` so fills and
 /// scrolls are trivial `memcpy`s.
@@ -72,6 +110,21 @@ impl Default for Cell {
         }
     }
 }
+
+/// A default cell, usable in `const` position (`Cell::default()` is not).
+const BLANK: Cell = Cell {
+    ch: ' ',
+    fg: Color::Reset,
+    bg: Color::Reset,
+    bold: false,
+    dim: false,
+    italic: false,
+    underline: false,
+    blink: false,
+    reverse: false,
+    strike: false,
+    width: 1,
+};
 
 /// Which glyph table `print` maps through. `ESC ( 0` selects DEC Special
 /// Graphics — this is how ncurses draws boxes on `TERM=xterm-256color`, so
@@ -134,6 +187,16 @@ pub struct Screen {
     pub kitty_keyboard: u8,
     /// Saved-flag stack backing the protocol's push (`>`) / pop (`<`) operations.
     kitty_stack: Vec<u8>,
+    /// What mouse events, if any, the pane's app asked to receive.
+    pub mouse: MouseTracking,
+
+    /// Lines that have scrolled off the top of the primary screen, oldest first,
+    /// capped at [`MAX_SCROLLBACK`]. Rows keep the width they had when they
+    /// scrolled off; the renderer clamps them to the current width.
+    scrollback: VecDeque<Box<[Cell]>>,
+    /// How many lines the *view* is scrolled back from live output. `0` = live.
+    /// Lives here because the scrollback it indexes lives here.
+    pub view_offset: usize,
 
     // Pending pen attributes applied to newly printed cells.
     pen: Cell,
@@ -180,6 +243,9 @@ impl Screen {
             app_cursor_keys: false,
             kitty_keyboard: 0,
             kitty_stack: Vec::new(),
+            mouse: MouseTracking::default(),
+            scrollback: VecDeque::new(),
+            view_offset: 0,
             pen: Cell::default(),
             wrap_pending: false,
             autowrap: true,
@@ -201,7 +267,7 @@ impl Screen {
         y as usize * self.cols as usize + x as usize
     }
 
-    /// Read a cell for rendering. `None` if out of bounds.
+    /// Read a live-screen cell. `None` if out of bounds.
     #[inline]
     pub fn cell(&self, x: u16, y: u16) -> Option<&Cell> {
         if x < self.cols && y < self.rows {
@@ -209,6 +275,62 @@ impl Screen {
         } else {
             None
         }
+    }
+
+    /// Read the cell the *viewer* should see at `(x, y)`, which comes from
+    /// scrollback while the view is scrolled back. This is what the renderer
+    /// uses; `cell` stays the live-screen accessor the emulator works against.
+    #[inline]
+    pub fn view_cell(&self, x: u16, y: u16) -> Option<&Cell> {
+        if x >= self.cols || y >= self.rows {
+            return None;
+        }
+        if self.view_offset == 0 {
+            return Some(&self.grid[self.idx(x, y)]);
+        }
+        // Rows above `view_offset` come from history; the rest is the live grid
+        // shifted down by that much.
+        if (y as usize) < self.view_offset {
+            let from_end = self.view_offset - y as usize;
+            let row = self.scrollback.get(self.scrollback.len().checked_sub(from_end)?)?;
+            // History rows keep the width they had when they scrolled off.
+            return row.get(x as usize).or(Some(&BLANK));
+        }
+        let live_y = y as usize - self.view_offset;
+        if live_y >= self.rows as usize {
+            return Some(&BLANK);
+        }
+        Some(&self.grid[live_y * self.cols as usize + x as usize])
+    }
+
+    /// Lines of history available to scroll back through.
+    pub fn scrollback_len(&self) -> usize {
+        self.scrollback.len()
+    }
+
+    /// Move the view by `delta` lines (negative scrolls back into history).
+    /// Returns `true` if the view actually moved.
+    pub fn scroll_view(&mut self, delta: isize) -> bool {
+        let max = self.scrollback.len();
+        let want = (self.view_offset as isize)
+            .saturating_sub(delta)
+            .clamp(0, max as isize) as usize;
+        let moved = want != self.view_offset;
+        self.view_offset = want;
+        moved
+    }
+
+    /// Jump the view to the oldest history / back to live output.
+    pub fn scroll_view_to(&mut self, offset: usize) -> bool {
+        let want = offset.min(self.scrollback.len());
+        let moved = want != self.view_offset;
+        self.view_offset = want;
+        moved
+    }
+
+    /// Snap back to live output. Returns `true` if the view moved.
+    pub fn scroll_to_live(&mut self) -> bool {
+        self.scroll_view_to(0)
     }
 
     /// Resize the grid, preserving as much content as possible.
@@ -255,6 +377,10 @@ impl Screen {
         self.scroll_bot = rows - 1;
         self.wrap_pending = false;
         self.tabs = default_tabs(cols);
+        // History rows keep their original width (`view_cell` pads or clips
+        // them); reflowing them would mean re-wrapping every stored line, and
+        // the view offset can't outlive a grid that just got shorter.
+        self.view_offset = self.view_offset.min(self.scrollback.len());
         // A narrower grid can slice a double-width glyph in half, leaving a lead
         // cell in the last column with nowhere to put its continuation.
         for y in 0..rows {
@@ -349,9 +475,36 @@ impl Screen {
         let start = top * cols;
         let end = (bot + 1) * cols;
         let shift = n * cols;
+        // Lines only enter scrollback when they leave the *top of the screen* on
+        // the primary buffer. A sub-region scroll (a TUI repainting part of its
+        // window) is not history, and neither is anything on the alternate
+        // screen — that is why `less` doesn't pollute your shell's scrollback.
+        if top == 0 && self.alt.is_none() {
+            let leaving: Vec<Box<[Cell]>> = (0..n)
+                .map(|row| {
+                    let s = row * cols;
+                    trim_trailing_blanks(&self.grid[s..s + cols])
+                })
+                .collect();
+            for row in leaving {
+                self.push_scrollback(row);
+            }
+        }
         self.grid.copy_within(start + shift..end, start);
         let blank = self.blank();
         self.grid[end - shift..end].fill(blank);
+    }
+
+    /// Append one line to history, evicting the oldest once full.
+    fn push_scrollback(&mut self, row: Box<[Cell]>) {
+        if self.scrollback.len() == MAX_SCROLLBACK {
+            self.scrollback.pop_front();
+        } else if self.view_offset > 0 {
+            // Keep a scrolled-back view pinned to the same content as new lines
+            // arrive, instead of letting it drift upward under the reader.
+            self.view_offset += 1;
+        }
+        self.scrollback.push_back(row);
     }
 
     /// Scroll rows `[top, bot]` down by `n` (blanks appear at the top).
@@ -574,7 +727,14 @@ impl Screen {
                 let to = self.cy as usize * cols;
                 self.grid[..to].fill(blank);
             }
-            2 | 3 => self.grid.fill(blank),
+            2 => self.grid.fill(blank),
+            // ED 3 additionally erases saved lines — this is what `clear` uses
+            // to drop scrollback.
+            3 => {
+                self.grid.fill(blank);
+                self.scrollback.clear();
+                self.view_offset = 0;
+            }
             _ => {}
         }
     }
@@ -707,6 +867,8 @@ impl Screen {
         if save_cursor {
             self.save_cursor();
         }
+        // History belongs to the shell, not to the full-screen app taking over.
+        self.view_offset = 0;
         let fresh = vec![self.blank(); self.grid.len()];
         self.alt = Some(Box::new(SavedScreen {
             grid: std::mem::replace(&mut self.grid, fresh),
@@ -756,6 +918,12 @@ impl Screen {
             }
             7 => self.autowrap = on,          // DECAWM
             25 => self.cursor_visible = on,   // DECTCEM
+            // Mouse tracking. The level is highest-wins so that an app enabling
+            // 1002 after 1000 doesn't silently downgrade itself on the way out.
+            1000 => self.set_mouse_level(MouseLevel::Click, on),
+            1002 => self.set_mouse_level(MouseLevel::Drag, on),
+            1003 => self.set_mouse_level(MouseLevel::Motion, on),
+            1006 | 1015 => self.mouse.sgr = on,
             47 | 1047 => {
                 if on {
                     self.enter_alt_screen(false)
@@ -782,11 +950,32 @@ impl Screen {
         }
     }
 
+    /// Raise the tracking level on set; on reset, drop to `Off` only if this was
+    /// the level in force (a stray `?1000l` shouldn't cancel `?1003h`).
+    fn set_mouse_level(&mut self, level: MouseLevel, on: bool) {
+        if on {
+            self.mouse.level = self.mouse.level.max(level);
+        } else if self.mouse.level <= level {
+            self.mouse.level = MouseLevel::Off;
+        }
+    }
+
     fn reply(&mut self, bytes: &[u8]) {
         if self.responses.len() + bytes.len() <= MAX_RESPONSES {
             self.responses.extend_from_slice(bytes);
         }
     }
+}
+
+/// Store a history line without its run of untouched trailing cells.
+///
+/// This is what makes scrollback affordable. A `Cell` is 20 bytes, so keeping
+/// full-width rows would cost ~40 MB per pane at 200 columns — real lines are
+/// mostly short, and `view_cell` pads anything past a stored row's end with
+/// blanks, so the trimmed form renders identically.
+fn trim_trailing_blanks(row: &[Cell]) -> Box<[Cell]> {
+    let end = row.iter().rposition(|c| *c != BLANK).map_or(0, |i| i + 1);
+    row[..end].to_vec().into_boxed_slice()
 }
 
 fn default_tabs(cols: u16) -> Vec<bool> {
@@ -1318,6 +1507,13 @@ mod tests {
             .collect()
     }
 
+    /// What the renderer would show on row `y`, honouring the scrollback view.
+    fn row_text_view(screen: &Screen, y: u16) -> String {
+        (0..screen.cols)
+            .map(|x| screen.view_cell(x, y).unwrap().ch)
+            .collect()
+    }
+
     #[test]
     fn prints_plain_text() {
         let s = render(20, 5, b"hello");
@@ -1714,6 +1910,136 @@ mod tests {
         feed(&mut s, b"\x1b[?1049l");
         assert_eq!(row_text(&s, 0).trim_end(), "shell prompt");
         assert_eq!((s.cols, s.rows), (30, 6));
+    }
+
+    // ---- scrollback --------------------------------------------------------
+
+    #[test]
+    fn lines_scrolled_off_the_top_enter_scrollback() {
+        let s = render(10, 3, b"1\r\n2\r\n3\r\n4\r\n5");
+        // Screen holds the last three lines; the first two are history.
+        assert_eq!(s.scrollback_len(), 2);
+        assert_eq!(row_text(&s, 0).trim_end(), "3");
+    }
+
+    #[test]
+    fn view_scrolls_back_into_history_and_returns() {
+        let mut s = render(10, 3, b"1\r\n2\r\n3\r\n4\r\n5");
+        assert!(s.scroll_view(-2));
+        assert_eq!(s.view_offset, 2);
+        // Rows now show history followed by the top of the live screen.
+        assert_eq!(row_text_view(&s, 0).trim_end(), "1");
+        assert_eq!(row_text_view(&s, 1).trim_end(), "2");
+        assert_eq!(row_text_view(&s, 2).trim_end(), "3");
+        assert!(s.scroll_to_live());
+        assert_eq!(row_text_view(&s, 0).trim_end(), "3");
+    }
+
+    #[test]
+    fn view_cannot_scroll_past_the_ends() {
+        let mut s = render(10, 3, b"1\r\n2\r\n3\r\n4\r\n5");
+        s.scroll_view(-999);
+        assert_eq!(s.view_offset, 2, "clamped to available history");
+        assert!(!s.scroll_view(-1), "already at the top");
+        s.scroll_view(999);
+        assert_eq!(s.view_offset, 0);
+        assert!(!s.scroll_view(1), "already live");
+    }
+
+    /// A scrolled-back reader must keep looking at the same lines while new
+    /// output arrives, rather than having the text drift out from under them.
+    #[test]
+    fn scrolled_view_stays_pinned_as_output_arrives() {
+        let mut s = render(10, 3, b"1\r\n2\r\n3\r\n4\r\n5");
+        s.scroll_view(-2);
+        assert_eq!(row_text_view(&s, 0).trim_end(), "1");
+        feed(&mut s, b"\r\n6\r\n7");
+        assert_eq!(row_text_view(&s, 0).trim_end(), "1", "same content in view");
+        assert_eq!(s.view_offset, 4);
+    }
+
+    /// Trimming must not change what the reader sees: short rows pad back out.
+    #[test]
+    fn trimmed_history_rows_render_identically() {
+        let mut s = render(20, 2, b"hi\r\n");
+        feed(&mut s, b"there\r\nlive");
+        s.scroll_view(-2);
+        assert_eq!(row_text_view(&s, 0), "hi                  ");
+        assert_eq!(row_text_view(&s, 1), "there               ");
+    }
+
+    #[test]
+    fn scrollback_is_capped() {
+        let mut s = Screen::new(8, 2);
+        let mut parser = Parser::new();
+        for i in 0..(MAX_SCROLLBACK + 500) {
+            for &b in format!("{i}\r\n").as_bytes() {
+                parser.advance(&mut s, b);
+            }
+        }
+        assert_eq!(s.scrollback_len(), MAX_SCROLLBACK);
+    }
+
+    /// `less`/`vim` must not push their repaints into the shell's history.
+    #[test]
+    fn alternate_screen_does_not_feed_scrollback() {
+        let mut s = render(10, 2, b"shell\r\n");
+        let before = s.scrollback_len();
+        feed(&mut s, b"\x1b[?1049h");
+        feed(&mut s, b"a\r\nb\r\nc\r\nd\r\ne\r\nf\r\n");
+        assert_eq!(s.scrollback_len(), before, "alt screen kept out of history");
+        feed(&mut s, b"\x1b[?1049l");
+    }
+
+    /// Neither should a TUI scrolling a sub-region of the screen.
+    #[test]
+    fn sub_region_scroll_does_not_feed_scrollback() {
+        let mut s = render(10, 6, b"\x1b[2;5r");
+        let before = s.scrollback_len();
+        feed(&mut s, b"\x1b[5;1Hx\r\ny\r\nz\r\n");
+        assert_eq!(s.scrollback_len(), before);
+    }
+
+    #[test]
+    fn ed3_clears_saved_lines() {
+        let mut s = render(10, 2, b"1\r\n2\r\n3\r\n4");
+        assert!(s.scrollback_len() > 0);
+        feed(&mut s, b"\x1b[3J");
+        assert_eq!(s.scrollback_len(), 0);
+        assert_eq!(s.view_offset, 0);
+    }
+
+    #[test]
+    fn entering_the_alternate_screen_snaps_the_view_live() {
+        let mut s = render(10, 3, b"1\r\n2\r\n3\r\n4\r\n5");
+        s.scroll_view(-2);
+        feed(&mut s, b"\x1b[?1049h");
+        assert_eq!(s.view_offset, 0);
+    }
+
+    // ---- mouse tracking ----------------------------------------------------
+
+    #[test]
+    fn tracks_mouse_modes() {
+        let s = render(10, 2, b"");
+        assert!(!s.mouse.enabled());
+        let s = render(10, 2, b"\x1b[?1000h\x1b[?1006h");
+        assert_eq!(s.mouse.level, MouseLevel::Click);
+        assert!(s.mouse.sgr);
+        let s = render(10, 2, b"\x1b[?1002h");
+        assert_eq!(s.mouse.level, MouseLevel::Drag);
+        let s = render(10, 2, b"\x1b[?1003h");
+        assert_eq!(s.mouse.level, MouseLevel::Motion);
+    }
+
+    /// Apps commonly enable 1000 then 1002; the later reset of the *lower* mode
+    /// must not silently turn tracking off.
+    #[test]
+    fn lower_mouse_mode_reset_does_not_cancel_a_higher_one() {
+        let s = render(10, 2, b"\x1b[?1000h\x1b[?1002h\x1b[?1000l");
+        assert_eq!(s.mouse.level, MouseLevel::Drag);
+        let s = render(10, 2, b"\x1b[?1002h\x1b[?1002l");
+        assert_eq!(s.mouse.level, MouseLevel::Off);
     }
 
     /// Fuzz-ish guard: no byte sequence may panic the emulator. A panic in the

@@ -6,7 +6,7 @@
 
 use std::io;
 
-use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -20,6 +20,8 @@ pub enum ClientMsg {
     Attach { cols: u16, rows: u16 },
     /// A keystroke to feed to the session.
     Key(WireKey),
+    /// A mouse event at client-terminal coordinates.
+    Mouse(WireMouse),
     /// A bracketed paste from the client's terminal, forwarded to the focused pane.
     Paste(String),
     /// The client's terminal was resized.
@@ -40,6 +42,89 @@ pub enum ServerMsg {
     Frame(Vec<u8>),
     /// The server is shutting down (its last shell exited).
     Bye,
+}
+
+/// A serialisable `crossterm::event::MouseEvent`, in the client's terminal
+/// coordinates (0-based). The server maps them onto panes itself, since only it
+/// knows the layout.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WireMouse {
+    pub kind: MouseAction,
+    pub button: MouseButton,
+    pub col: u16,
+    pub row: u16,
+    /// SHIFT=1, CONTROL=2, ALT=4 (bitwise-or), same encoding as `WireKey`.
+    pub mods: u8,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MouseAction {
+    Down,
+    Up,
+    Drag,
+    Moved,
+    ScrollUp,
+    ScrollDown,
+    ScrollLeft,
+    ScrollRight,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MouseButton {
+    Left,
+    Middle,
+    Right,
+    /// Motion or scroll events carry no button.
+    None,
+}
+
+impl WireMouse {
+    pub fn from_event(e: MouseEvent) -> Self {
+        use crossterm::event::{MouseButton as CB, MouseEventKind as CK};
+        let btn = |b: CB| match b {
+            CB::Left => MouseButton::Left,
+            CB::Middle => MouseButton::Middle,
+            CB::Right => MouseButton::Right,
+        };
+        let (kind, button) = match e.kind {
+            CK::Down(b) => (MouseAction::Down, btn(b)),
+            CK::Up(b) => (MouseAction::Up, btn(b)),
+            CK::Drag(b) => (MouseAction::Drag, btn(b)),
+            CK::Moved => (MouseAction::Moved, MouseButton::None),
+            CK::ScrollUp => (MouseAction::ScrollUp, MouseButton::None),
+            CK::ScrollDown => (MouseAction::ScrollDown, MouseButton::None),
+            CK::ScrollLeft => (MouseAction::ScrollLeft, MouseButton::None),
+            CK::ScrollRight => (MouseAction::ScrollRight, MouseButton::None),
+        };
+        let mut mods = 0u8;
+        if e.modifiers.contains(KeyModifiers::SHIFT) {
+            mods |= 1;
+        }
+        if e.modifiers.contains(KeyModifiers::CONTROL) {
+            mods |= 2;
+        }
+        if e.modifiers.contains(KeyModifiers::ALT) {
+            mods |= 4;
+        }
+        WireMouse {
+            kind,
+            button,
+            col: e.column,
+            row: e.row,
+            mods,
+        }
+    }
+
+    /// True for wheel events, which mmux may consume for scrollback.
+    pub fn is_scroll(&self) -> bool {
+        matches!(
+            self.kind,
+            MouseAction::ScrollUp
+                | MouseAction::ScrollDown
+                | MouseAction::ScrollLeft
+                | MouseAction::ScrollRight
+        )
+    }
 }
 
 /// A serialisable subset of `crossterm::event::KeyEvent`.

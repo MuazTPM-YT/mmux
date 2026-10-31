@@ -3,14 +3,14 @@
 #
 # Usage:
 #   ./install.sh                      # from a checkout of the repo
-#   curl -fsSL <raw-url>/install.sh | sh   # once hosted (set MMUX_REPO below)
+#   curl -fsSL https://raw.githubusercontent.com/MuazTPM-YT/mmux/main/install.sh | sh
 #
 # Environment:
 #   MMUX_REPO    git URL to clone when not run inside the repo
 #   MMUX_BINDIR  install destination (default: ~/.local/bin)
 set -eu
 
-REPO="${MMUX_REPO:-https://github.com/6muazx/mmux}"
+REPO="${MMUX_REPO:-https://github.com/MuazTPM-YT/mmux}"
 BINDIR="${MMUX_BINDIR:-$HOME/.local/bin}"
 
 info() { printf '\033[36m::\033[0m %s\n' "$1"; }

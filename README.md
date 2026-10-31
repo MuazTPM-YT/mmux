@@ -35,16 +35,16 @@ collide with Hyprland's `$mainMod`.
 
 ## Install
 
-**One-liner** (once hosted — set `MMUX_REPO` to your fork):
+**One-liner:**
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/6muazx/mmux/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/MuazTPM-YT/mmux/main/install.sh | sh
 ```
 
 **From a checkout:**
 
 ```sh
-git clone https://github.com/6muazx/mmux && cd mmux
+git clone https://github.com/MuazTPM-YT/mmux && cd mmux
 ./install.sh          # builds release + installs to ~/.local/bin
 ```
 

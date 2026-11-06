@@ -28,6 +28,7 @@ async fn main() -> Result<()> {
     match args.get(1).map(String::as_str) {
         Some("__server") => {
             let name = args.get(2).cloned().unwrap_or_else(|| "default".into());
+            session::check_runtime_dir()?;
             server::run(name).await
         }
         Some("--help") | Some("-h") => {
@@ -44,8 +45,10 @@ async fn main() -> Result<()> {
             eprintln!("mmux: unknown option '{flag}' (try --help)");
             std::process::exit(2);
         }
-        Some(name) => client::run(session::sanitize(name)).await,
-        None => client::run("default".into()).await,
+        name => {
+            session::check_runtime_dir()?;
+            client::run(session::sanitize(name.unwrap_or("default"))).await
+        }
     }
 }
 
@@ -69,6 +72,7 @@ KEYS (prefix = Alt):
     Alt+q                 Close pane      Alt+t  New space     Alt+r  Rename space
     Alt+1..9              Switch space    Alt+left/right  Cycle spaces
     Alt+Enter             Detach session
+    Alt+h                 Show these keys inside mmux
 
 SCROLLBACK (10000 lines per pane):
     Mouse wheel           Scroll history; typing returns to live output
@@ -78,7 +82,7 @@ SCROLLBACK (10000 lines per pane):
 
 MOUSE:
     Click                 Focus the pane under the pointer
-    Drag a pane border    Resize the split
+    Drag a pane edge      Resize the split
     Shift+drag            Bypasses mmux — your terminal's own select and copy
 
     Apps that request mouse tracking (vim, htop, fzf) receive clicks and the

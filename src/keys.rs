@@ -26,6 +26,8 @@ pub enum Action {
     NextSpace,
     /// Enter keyboard scrollback navigation on the focused pane.
     EnterScroll,
+    /// Show the keybinding popup.
+    Help,
 }
 
 /// Recognise an `Alt` master-prefix command. Returns `None` for anything that
@@ -36,6 +38,7 @@ pub enum Action {
 /// * `Alt + W/A/S/D`  (i.e. `Alt+Shift`) → create a new pane up/left/down/right
 /// * `Alt + q` close pane · `Alt + t` new space · `Alt + r` rename space
 /// * `Alt + 1..9` switch space · `Alt + ←/→` cycle spaces
+/// * `Alt + h` keybinding help
 ///
 /// "Shift" is detected robustly: an uppercase char OR the SHIFT flag, because
 /// terminals consume the Shift modifier when it produces a shifted glyph.
@@ -57,6 +60,7 @@ pub fn parse_command(key: KeyEvent) -> Option<Action> {
                 'q' => Some(Action::ClosePane),
                 't' => Some(Action::NewSpace),
                 'r' => Some(Action::RenameSpace),
+                'h' => Some(Action::Help),
                 _ => None,
             }
         }
@@ -345,6 +349,9 @@ mod tests {
         assert_eq!(parse_command(alt('q')), Some(Action::ClosePane));
         assert_eq!(parse_command(alt('t')), Some(Action::NewSpace));
         assert_eq!(parse_command(alt('r')), Some(Action::RenameSpace));
+        assert_eq!(parse_command(alt('h')), Some(Action::Help));
+        // Plain `h` is ordinary input.
+        assert!(parse_command(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE)).is_none());
     }
 
     #[test]

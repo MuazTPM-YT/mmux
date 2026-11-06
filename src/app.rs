@@ -18,12 +18,14 @@ const MAX_SPACE_NAME: usize = 64;
 /// Lines the wheel moves per notch, matching what terminals normally do.
 const SCROLL_LINES: isize = 3;
 
-/// Input mode: normal command/passthrough, capturing a new Space name, or
-/// navigating the focused pane's scrollback from the keyboard.
+/// Input mode: normal command/passthrough, capturing a new Space name,
+/// navigating the focused pane's scrollback from the keyboard, or showing the
+/// keybinding popup.
 pub enum Mode {
     Normal,
     Rename(String),
     Scroll,
+    Help,
 }
 
 pub struct App {
@@ -95,6 +97,12 @@ impl App {
                     Mode::Rename(_) => self.handle_rename_key(key),
                     Mode::Scroll => self.handle_scroll_key(key),
                     Mode::Normal => self.handle_normal_key(key),
+                    // Any key closes the popup and is swallowed, so a stray
+                    // keypress can't reach the shell hidden behind it.
+                    Mode::Help => {
+                        self.mode = Mode::Normal;
+                        true
+                    }
                 }
             }
             // A resize must reflow the layout on the next draw.
@@ -193,11 +201,20 @@ impl App {
             };
         }
 
-        // Grabbing a seam takes precedence over the panes either side of it.
+        // Grabbing a seam takes precedence over the panes either side of it —
+        // unless the app there tracks the mouse. Panes have no frames, so the
+        // seam is made of the panes' own edge cells, and an app (vim, htop)
+        // must keep getting its clicks on them.
         if matches!(ev.kind, MouseAction::Down) {
             if let Some(d) = self.mgr.divider_at(ev.col, ev.row) {
-                self.dragging = Some(d);
-                return false;
+                let pane = self.mgr.pane_at(ev.col, ev.row);
+                let app_wants = pane
+                    .and_then(|id| self.mgr.panes.get(&id))
+                    .is_some_and(|p| p.screen.mouse.enabled());
+                if !app_wants {
+                    self.dragging = Some(d);
+                    return pane.is_some_and(|id| self.mgr.focus_pane(id));
+                }
             }
         }
 
@@ -298,6 +315,7 @@ impl App {
                 // directly instead of backspacing the old one.
                 self.mode = Mode::Rename(String::new());
             }
+            Action::Help => self.mode = Mode::Help,
             Action::SwitchSpace(i) => self.mgr.switch_to(i),
             Action::PrevSpace => self.mgr.prev_space(),
             Action::NextSpace => self.mgr.next_space(),

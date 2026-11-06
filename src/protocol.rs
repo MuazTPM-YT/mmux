@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 /// Reject absurd frame sizes so a corrupt length can't trigger a huge alloc.
-const MAX_FRAME: u32 = 8 * 1024 * 1024;
+pub const MAX_FRAME: u32 = 8 * 1024 * 1024;
 
 #[derive(Serialize, Deserialize, Debug)]
 pub enum ClientMsg {

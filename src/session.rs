@@ -12,6 +12,7 @@
 
 use std::fs;
 use std::io::Write;
+use std::os::unix::fs::DirBuilderExt;
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 
@@ -47,8 +48,34 @@ fn runtime_dir() -> PathBuf {
             let uid = unsafe { libc::getuid() };
             PathBuf::from(format!("/tmp/mmux-{uid}"))
         });
-    let _ = fs::create_dir_all(&base);
+    // Private from birth: whoever can write here can plant a socket that the
+    // client then sends every keystroke to.
+    let _ = fs::DirBuilder::new().recursive(true).mode(0o700).create(&base);
     base
+}
+
+/// Refuse a socket directory another user controls.
+///
+/// The `/tmp/mmux-<uid>` fallback has a predictable name, so another local user
+/// can create it first (or plant a symlink there) and then swap in their own
+/// socket — the client would attach to it and hand over every keystroke,
+/// passwords included. Run once at start-up, before any socket is touched.
+pub fn check_runtime_dir() -> anyhow::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    let dir = runtime_dir();
+    let meta = fs::symlink_metadata(&dir)
+        .map_err(|e| anyhow::anyhow!("socket dir {}: {e}", dir.display()))?;
+    // SAFETY: `getuid` is always safe — it reads the calling process's real
+    // user ID and cannot fail or cause UB.
+    let uid = unsafe { libc::getuid() };
+    if !meta.is_dir() || meta.uid() != uid || meta.mode() & 0o022 != 0 {
+        anyhow::bail!(
+            "socket dir {} is not a directory owned by you and closed to other \
+             users' writes; remove it or set MMUX_RUNTIME_DIR",
+            dir.display()
+        );
+    }
+    Ok(())
 }
 
 fn data_dir() -> PathBuf {
@@ -89,9 +116,13 @@ pub fn is_active(name: &str) -> bool {
     }
     match UnixStream::connect(&path) {
         Ok(_) => true,
-        Err(_) => {
-            // Stale socket from a crashed server — remove it.
-            let _ = fs::remove_file(&path);
+        Err(e) => {
+            // Refused = nobody listening: a stale socket from a crashed server,
+            // safe to remove. Any other error (e.g. permissions) says nothing
+            // about liveness, so leave the file alone.
+            if e.kind() == std::io::ErrorKind::ConnectionRefused {
+                let _ = fs::remove_file(&path);
+            }
             false
         }
     }
@@ -253,6 +284,19 @@ mod tests {
         assert!(delete("alpha"));
         let names: Vec<String> = list().into_iter().map(|s| s.name).collect();
         assert!(!names.contains(&"alpha".to_string()));
+    }
+
+    /// A socket dir other users can write to is refused; our own private one
+    /// passes.
+    #[test]
+    fn runtime_dir_must_be_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let env = Env::new();
+        assert!(check_runtime_dir().is_ok());
+        let run = env.dir.join("run");
+        assert_eq!(fs::metadata(&run).unwrap().permissions().mode() & 0o777, 0o700);
+        fs::set_permissions(&run, fs::Permissions::from_mode(0o777)).unwrap();
+        assert!(check_runtime_dir().is_err());
     }
 
     #[test]

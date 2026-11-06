@@ -18,9 +18,9 @@ use crate::screen::Screen;
 /// How a split arranges its two children.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SplitDir {
-    /// Children side by side (left | right) — bound to `Prefix + h`.
+    /// Children side by side (left | right) — `Alt+A` / `Alt+D`.
     Horizontal,
-    /// Children stacked (top / bottom) — bound to `Prefix + v`.
+    /// Children stacked (top / bottom) — `Alt+W` / `Alt+S`.
     Vertical,
 }
 
@@ -136,9 +136,9 @@ impl Node {
             Node::Leaf(id) => leaves.push((*id, area)),
             Node::Split { id, dir, ratio, a, b } => {
                 let (ra, rb) = split_rect(area, *dir, *ratio);
-                // The seam is the pair of adjacent borders the two children
-                // draw: `a`'s trailing edge and `b`'s leading edge. Two cells
-                // wide makes it comfortable to grab.
+                // The seam is `a`'s last column/row and `b`'s first. Panes
+                // have no frames, so these are content cells; two wide makes
+                // the seam comfortable to grab.
                 let rect = match dir {
                     SplitDir::Horizontal => Rect {
                         x: rb.x.saturating_sub(1),
@@ -220,11 +220,9 @@ pub struct Pane {
     pub screen: Screen,
     parser: Parser,
     pub process: PtyProcess,
-    /// Inner (content) rect from the last render — used for focus nav & resize.
+    /// Screen rect from the last render — used for focus nav, PTY resize and
+    /// mouse hit-testing.
     pub rect: Rect,
-    /// Outer rect including the border, for mouse hit-testing: clicking a pane's
-    /// frame should focus it, not fall through to whatever is behind.
-    pub outer: Rect,
 }
 
 impl Pane {
@@ -329,7 +327,6 @@ impl Manager {
                 parser: Parser::new(),
                 process,
                 rect: Rect::default(),
-                outer: Rect::default(),
             },
         );
         Ok(id)
@@ -483,13 +480,13 @@ impl Manager {
         }
     }
 
-    /// The pane whose frame contains this screen position, if any. Only panes in
+    /// The pane whose rect contains this screen position, if any. Only panes in
     /// the active Space are considered — the others aren't on screen.
     pub fn pane_at(&self, x: u16, y: u16) -> Option<u64> {
         let mut ids = Vec::new();
         self.active_space()?.root.leaves(&mut ids);
         ids.into_iter()
-            .find(|id| self.panes.get(id).is_some_and(|p| contains(p.outer, x, y)))
+            .find(|id| self.panes.get(id).is_some_and(|p| contains(p.rect, x, y)))
     }
 
     /// The split seam under this position, if any.
@@ -681,8 +678,8 @@ mod tests {
         assert_eq!(dividers[0].area.width, 80);
     }
 
-    /// The seam sits on the two adjacent border columns/rows the children draw,
-    /// which is what makes it grabbable with a mouse.
+    /// The seam covers the edge column/row of each child, which is what makes
+    /// it grabbable with a mouse.
     #[test]
     fn divider_straddles_the_boundary_between_children() {
         let area = Rect { x: 0, y: 0, width: 80, height: 24 };

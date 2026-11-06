@@ -28,6 +28,8 @@ collide with Hyprland's `$mainMod`.
 - **🪟 WASD panes** — `Alt+wasd` moves focus, `Alt+WASD` splits a new pane in
   that direction. Arbitrary nested splits.
 - **🗂 Spaces** — tmux-style tabs, `Alt+1..9` to jump, `Alt+←/→` to cycle.
+- **🧘 Out of the way** — panes are frameless and there is no status bar;
+  `Alt+h` shows the keys when you need them.
 - **⚡ Fast & lean** — fully event-driven (zero idle CPU), a contiguous cell
   grid with `memmove` scrolling, and diffed rendering over a local socket.
 - **🎯 Real terminal emulation** — VTE-based, answers DA/DSR queries (no shell
@@ -101,6 +103,7 @@ creates a pane.
 | `Alt + ← / →` | Previous / next space |
 | `Alt + Enter` | Detach session |
 | `Alt + .` / `Alt + /` | Session list / search |
+| `Alt + h` | Show all keybindings (any key closes) |
 
 ## Configuration
 

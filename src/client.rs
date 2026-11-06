@@ -38,6 +38,17 @@ fn ensure_server(name: &str) -> Result<()> {
     if session::is_active(name) {
         return Ok(());
     }
+    // A Unix socket path must fit `sun_path` (108 bytes with the NUL). Past
+    // that the daemon's bind fails with its stderr already closed, so say why
+    // here rather than time out with "did not start".
+    let sock = session::socket_path(name);
+    if sock.as_os_str().len() > 107 {
+        return Err(anyhow!(
+            "socket path {} is too long for a Unix socket (max 107 bytes); \
+             use a shorter session name or MMUX_RUNTIME_DIR",
+            sock.display()
+        ));
+    }
     let exe = std::env::current_exe()?;
     let mut cmd = Command::new(exe);
     cmd.arg("__server")
@@ -57,7 +68,13 @@ fn ensure_server(name: &str) -> Result<()> {
             Ok(())
         });
     }
-    cmd.spawn()?;
+    let mut child = cmd.spawn()?;
+    // `setsid` detaches the daemon from the terminal but not from us: it stays
+    // our child. Reap it whenever it exits (e.g. shut down from the switcher)
+    // so it doesn't linger as a zombie for the rest of this client's life.
+    std::thread::spawn(move || {
+        let _ = child.wait();
+    });
 
     for _ in 0..150 {
         if session::is_active(name) {
@@ -201,7 +218,11 @@ async fn drive(mut session: String) -> Result<()> {
                     Some(Event::Paste(text)) => {
                         // Ignore pastes while an overlay owns the screen; otherwise
                         // forward to the session, which routes it to the focused pane.
+                        // A paste too big for one frame is dropped: the server
+                        // would reject it as corrupt and disconnect this client.
+                        // (+16 covers the message tag and length prefix.)
                         if overlay.is_none()
+                            && text.len() + 16 <= crate::protocol::MAX_FRAME as usize
                             && write_msg(&mut conn.writer, &ClientMsg::Paste(text)).await.is_err()
                         {
                             break;

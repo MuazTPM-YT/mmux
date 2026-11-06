@@ -48,6 +48,10 @@ mirrors a `crossterm::KeyEvent`; frames are raw escape bytes.
 a socket in the runtime dir and a record (name + space names) in the data dir.
 "active" = a server is listening (verified by connecting). Base dirs are
 overridable via `MMUX_RUNTIME_DIR` / `MMUX_DATA_DIR` (used by tests + E2E).
+The runtime dir is created `0700`, and `main` calls `check_runtime_dir` before
+anything touches a socket: a dir another user owns or can write to is refused,
+since whoever controls it can plant a socket and receive every keystroke.
+Socket paths must fit `sun_path` (107 bytes) — keep E2E temp dirs short.
 
 **App reducer (`app.rs`).** UI- and transport-agnostic: pure step functions
 (`handle_terminal_event`, `drain_pty`, `sync_sizes`) that the server drives. A
@@ -108,7 +112,9 @@ whenever that application enabled tracking (`Screen::mouse`), *except* wheel
 events while the view is scrolled back — otherwise there'd be no way to scroll
 back out of history. Everything else is an mmux gesture: click focuses a pane,
 dragging a `Divider` (captured during render, like `Pane::rect`) resizes a split,
-the wheel walks scrollback. Coordinates arrive in client-terminal space and are
+the wheel walks scrollback. Panes are drawn **frameless**, edge to edge, so a
+divider's hit area is the two panes' own edge cells; a press there starts a drag
+only if the pane's app is not tracking the mouse. Coordinates arrive in client-terminal space and are
 made pane-local before encoding. mmux deliberately implements **no text
 selection**: every terminal bypasses mouse reporting while Shift is held, so the
 outer terminal's own select-and-copy keeps working for free.
@@ -141,7 +147,7 @@ render everything underlined. Only intermediate-free CSIs reach the SGR/cursor a
 **Data flow for keystrokes (`keys.rs`):** the prefix is **`Alt`** (a modifier
 chord). `parse_command` requires `ALT`; lowercase `wasd` → `Focus(dir)`, uppercase
 `WASD` (Shift) → `NewPane(dir)`; `q/t/r`, digits, and arrows map to the space/pane
-commands. Anything unmatched goes to `encode_key` → bytes written to the focused
+commands; `h` opens the keybinding help. Anything unmatched goes to `encode_key` → bytes written to the focused
 PTY. "Shift" = uppercase char OR the SHIFT flag, because terminals consume Shift
 when it produces a shifted glyph (`Alt+Shift+1` arrives as `Alt+!`).
 
@@ -150,6 +156,13 @@ when it produces a shifted glyph (`Alt+Shift+1` arrives as `Alt+!`).
 Shift+Enter) and `app_cursor` (DECCKM — arrows must be SS3 `ESC O A`, not
 `ESC [ A`). Modified cursor keys always use the `CSI 1 ; m X` form; dropping the
 modifier is why `Ctrl+Right` word-motion silently did nothing.
+
+**Chrome (`ui.rs`).** One tab bar row on top; panes fill the rest with no
+borders (the focused pane is the one showing a cursor). There is no permanent
+status bar: the rename field and the scrollback indicator are drawn *over* the
+last pane row only while active — reserving a row would resize every pane each
+time it appeared. `Alt+h` (`Mode::Help`) draws a keybinding popup; any key
+closes it and is swallowed.
 
 **State (`state.rs`).** `Manager` owns every `Pane` in a `HashMap<u64, Pane>` and
 a `Vec<Space>` (tabs). Each `Space` holds a **binary layout tree** (`Node::Leaf` /

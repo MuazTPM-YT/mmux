@@ -10,7 +10,7 @@
 use std::time::Duration;
 
 use crossterm::event::{KeyCode, KeyEvent};
-use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::layout::{Constraint, Layout};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
@@ -18,6 +18,7 @@ use ratatui::Frame;
 
 use crate::protocol::{self, ClientMsg};
 use crate::session::{self, SessionInfo};
+use crate::ui::centered;
 
 /// What the switcher wants the client to do after a keystroke.
 pub enum Nav {
@@ -239,17 +240,6 @@ fn filter(query: &str) -> Vec<SessionInfo> {
 }
 
 // ---- rendering ------------------------------------------------------------
-
-fn centered(area: Rect, w: u16, h: u16) -> Rect {
-    let w = w.min(area.width);
-    let h = h.min(area.height);
-    Rect {
-        x: area.x + (area.width - w) / 2,
-        y: area.y + (area.height - h) / 2,
-        width: w,
-        height: h,
-    }
-}
 
 const ACCENT: Color = Color::Cyan;
 const FIELD_BG: Color = Color::Rgb(38, 40, 52);
